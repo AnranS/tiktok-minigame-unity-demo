@@ -180,6 +180,32 @@ namespace TikTokMiniGameDemo.EditorTools
             controller.ClearLogButton = clearBtn.GetComponent<Button>();
             controller.InitSdkButton = initBtn.GetComponent<Button>();
             controller.StatusText = statusText;
+            controller.PackageVersion = ReadSdkPackageVersion();
+        }
+
+        /// <summary>
+        /// Read the SDK plugin's <c>package.json</c> and pull the <c>version</c> field.
+        /// Falls back to <c>"?"</c> if the file is missing or malformed.
+        /// 读取 SDK 插件的 <c>package.json</c> 并取出 <c>version</c> 字段。
+        /// 文件缺失或解析失败时回退到 <c>"?"</c>。
+        /// </summary>
+        private static string ReadSdkPackageVersion()
+        {
+            const string PackageJsonPath = "Assets/Plugins/com.tiktok.minigame/package.json";
+            try
+            {
+                if (!File.Exists(PackageJsonPath)) return "?";
+                var json = File.ReadAllText(PackageJsonPath);
+                // EN: Minimal regex pull — avoids depending on a full JSON parser for one field.
+                // ZH: 用最小正则取 version 字段，避免为了一个字段引入完整 JSON 库。
+                var match = System.Text.RegularExpressions.Regex.Match(
+                    json, "\"version\"\\s*:\\s*\"([^\"]+)\"");
+                return match.Success ? match.Groups[1].Value : "?";
+            }
+            catch
+            {
+                return "?";
+            }
         }
 
         /// <summary>

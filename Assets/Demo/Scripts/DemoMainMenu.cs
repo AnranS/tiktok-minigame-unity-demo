@@ -36,6 +36,14 @@ namespace TikTokMiniGameDemo
         /// <summary>Tiny status text under the title showing inited / not inited. / 标题下方显示 SDK 已初始化 / 未初始化的小字。</summary>
         public Text StatusText;
 
+        /// <summary>
+        /// SDK package version baked in by <see cref="EditorTools.DemoSceneBuilder"/> at
+        /// scene-rebuild time by reading <c>Assets/Plugins/com.tiktok.minigame/package.json</c>.
+        /// 由 <see cref="EditorTools.DemoSceneBuilder"/> 在重建场景时读取
+        /// <c>Assets/Plugins/com.tiktok.minigame/package.json</c> 写入的 SDK 包版本号。
+        /// </summary>
+        public string PackageVersion = "?";
+
         // -----------------------------------------------------------------
         // EN: Runtime state.
         // ZH: 运行时状态。
@@ -58,9 +66,14 @@ namespace TikTokMiniGameDemo
 
         private void Start()
         {
-            // EN: TT.TTSDKVersion is safe to read before InitSDK — it's a hard-coded constant.
-            // ZH: TT.TTSDKVersion 是常量字符串，InitSDK 之前就能读。
-            TitleText.text = $"TikTok Mini Game SDK Demo  ·  v{TT.TTSDKVersion}";
+            // EN: Title shows the SDK *package* version (the unitypackage you imported),
+            //     baked in by DemoSceneBuilder. We prefer it over TT.TTSDKVersion because
+            //     TT.TTSDKVersion tracks the internal SDK source revision (e.g. 6.3.9),
+            //     while CPs usually think in terms of the released package (e.g. 1.1.1).
+            // ZH: 标题显示 SDK *包*版本（你导入的 unitypackage），由 DemoSceneBuilder 烘焙。
+            //     用它而不是 TT.TTSDKVersion，因为后者跟踪 SDK 内部源码版本（如 6.3.9），
+            //     而 CP 一般习惯按发版包号（如 1.1.1）来识别。
+            TitleText.text = $"TikTok Mini Game SDK Demo  ·  v{PackageVersion}";
             UpdateStatus();
 
             ClearLogButton.onClick.AddListener(ClearLog);

@@ -2,6 +2,14 @@
 
 **English** · [中文](README.zh.md)
 
+> ## 📦 Get the SDK
+>
+> **[⬇️ Download `com.tiktok.minigame@1.1.1-Release.unitypackage`](./com.tiktok.minigame@1.1.1-Release.unitypackage)** (1.6 MB)
+>
+> The complete TikTok Mini Game SDK is shipped in this repo as a single Unity package.
+> Drag-and-drop it into any Unity 2022.3 project, or follow
+> [Integrating the SDK](#integrating-the-sdk-in-your-own-project) for the full step-by-step.
+
 A reference Unity project that integrates the **TikTok Mini Game SDK (TTSDK)** and exposes
 every public `TT.*` API through clickable buttons grouped by category. The log panel mirrors
 every callback so you can see exactly what each API returns, both inside Unity Editor and

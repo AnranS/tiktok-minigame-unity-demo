@@ -2,6 +2,14 @@
 
 [English](README.md) · **中文**
 
+> ## 📦 SDK 下载
+>
+> **[⬇️ 下载 `com.tiktok.minigame@1.1.1-Release.unitypackage`](./com.tiktok.minigame@1.1.1-Release.unitypackage)** (1.6 MB)
+>
+> 完整的 TikTok 小游戏 SDK 已经以单个 Unity 包的形式放在本仓库根目录。
+> 拖进任意 Unity 2022.3 工程即可使用，详细步骤见
+> [在你自己的工程里集成 SDK](#在你自己的工程里集成-sdk)。
+
 接入 **TikTok 小游戏 SDK（TTSDK）** 的 Unity 参考工程，按分类把每一个公开的 `TT.*` 接口
 做成可点击的按钮，所有回调结果实时滚到日志面板里——既能在 Unity Editor 里跑通，也能在
 抖音小游戏容器内真机调试。
