@@ -47,6 +47,9 @@ GameGlobal.managerConfig = managerConfig;
 
 function main() {
   // const UnityManager = requirePlugin('UnityPlugin/index.js');
+  // Cross-repository launch timing contract. Older unity-plugin builds ignore
+  // this optional field; newer builds validate it and safely fall back.
+  GameGlobal.__unityPluginRequireStartTime = Date.now();
   const UnityManager = require('./plugin.js');
   console.log("UnityManager.version = ", UnityManager.version);
   const info = tt.getSystemInfoSync();

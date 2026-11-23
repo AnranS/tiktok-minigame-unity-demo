@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using UnityEngine.Networking;
 using UnityEngine.ResourceManagement.AsyncOperations;
@@ -433,7 +434,6 @@ namespace UnityEngine.ResourceManagement.ResourceProviders
         }
 
         AssetBundle m_AssetBundle;
-        DownloadHandlerTTAssetBundle m_downloadHandler;
         AsyncOperation m_RequestOperation;
         internal TTWebRequestQueueOperation m_WebRequestQueueOperation;
         internal ProvideHandle m_ProvideHandle;
@@ -585,19 +585,6 @@ namespace UnityEngine.ResourceManagement.ResourceProviders
 
         public AssetBundle GetAssetBundle()
         {
-            if (m_AssetBundle == null)
-            {
-                if (m_downloadHandler != null)
-                {
-                    m_AssetBundle = m_downloadHandler.assetBundle;
-                    m_downloadHandler.Dispose();
-                    m_downloadHandler = null;
-                } else if (m_RequestOperation is TTAssetBundleRequest r)
-                {
-                    m_AssetBundle = r.assetBundle;
-                }
-            }
-            
             return m_AssetBundle;
         }
 
@@ -870,7 +857,8 @@ namespace UnityEngine.ResourceManagement.ResourceProviders
             }
 
             m_RequestCompletedCallbackCalled = true;
-            CompleteBundleLoad((op as TTAssetBundleRequest).assetBundle);
+            CompleteBundleLoad(
+                (op as AssetBundleCreateRequest)?.assetBundle);
         }
 
         private void CompleteBundleLoad(AssetBundle bundle)
@@ -905,17 +893,64 @@ namespace UnityEngine.ResourceManagement.ResourceProviders
             {
                 if (!m_Completed)
                 {
-#if ENABLE_ADDRESSABLE_PROFILER
-                    AddBundleToProfiler(Profiling.ContentStatus.Active, m_Source);
-#endif
-                    m_AssetBundle = downloadHandler.assetBundle;
-                    downloadHandler.Dispose();
+                    Exception bundleLoadException = null;
+                    try
+                    {
+                        var standardDownloadHandler =
+                            webReq.downloadHandler as
+                                DownloadHandlerAssetBundle;
+                        m_AssetBundle = downloadHandler != null
+                            ? downloadHandler.assetBundle
+                            : standardDownloadHandler?.assetBundle;
+                    }
+                    catch (Exception exception)
+                    {
+                        bundleLoadException = exception;
+                    }
+                    finally
+                    {
+                        webReq.downloadHandler?.Dispose();
+                    }
                     downloadHandler = null;
-                    m_ProvideHandle.Complete(this, true, null);
+                    if (bundleLoadException != null)
+                    {
+                        m_ProvideHandle.Complete<TTAssetBundleResource>(
+                            null,
+                            false,
+                            new TTRemoteProviderException(
+                                string.Format(
+                                    "AssetBundle materialization failed: '{0}'.",
+                                    m_TransformedInternalId),
+                                m_ProvideHandle.Location,
+                                null,
+                                bundleLoadException));
+                    }
+                    else if (m_AssetBundle != null)
+                    {
+#if ENABLE_ADDRESSABLE_PROFILER
+                        AddBundleToProfiler(
+                            Profiling.ContentStatus.Active,
+                            m_Source);
+#endif
+                        m_ProvideHandle.Complete(this, true, null);
+                    }
+                    else
+                    {
+                        m_ProvideHandle.Complete<TTAssetBundleResource>(
+                            null,
+                            false,
+                            new RemoteProviderException(
+                                string.Format(
+                                    "Web request returned no AssetBundle: '{0}'.",
+                                    m_TransformedInternalId),
+                                m_ProvideHandle.Location));
+                    }
                     m_Completed = true;
                 }
 #if ENABLE_CACHING
-                if (!string.IsNullOrEmpty(m_Options.Hash) && m_Options.ClearOtherCachedVersionsWhenLoaded)
+                if (m_Options != null &&
+                    !string.IsNullOrEmpty(m_Options.Hash) &&
+                    m_Options.ClearOtherCachedVersionsWhenLoaded)
                     Caching.ClearOtherCachedVersions(m_Options.BundleName, Hash128.Parse(m_Options.Hash));
 #endif
             }
@@ -928,7 +963,7 @@ namespace UnityEngine.ResourceManagement.ResourceProviders
                     uwrResult = new TTUnityWebRequestResult(m_WebRequestQueueOperation.m_WebRequest);
 
                 downloadHandler = webReq.downloadHandler as DownloadHandlerTTAssetBundle;
-                downloadHandler.Dispose();
+                webReq.downloadHandler?.Dispose();
                 downloadHandler = null;
                 bool forcedRetry = false;
                 string message = $"Web request failed, retrying ({m_Retries}/{m_Options.RetryCount})...\n{uwrResult}";
@@ -984,7 +1019,28 @@ namespace UnityEngine.ResourceManagement.ResourceProviders
             unloadOp = null;
             if (m_AssetBundle != null)
             {
-                unloadOp = m_AssetBundle.UnloadAsync(true);
+                var trackedBundle = m_AssetBundle;
+                try
+                {
+                    unloadOp = trackedBundle.UnloadAsync(true);
+                }
+                catch
+                {
+                    TTAssetBundle.ReleaseAssetBundleTracking(
+                        trackedBundle);
+                    throw;
+                }
+                if (unloadOp == null || unloadOp.isDone)
+                {
+                    TTAssetBundle.ReleaseAssetBundleTracking(
+                        trackedBundle);
+                }
+                else
+                {
+                    unloadOp.completed += operation =>
+                        TTAssetBundle.ReleaseAssetBundleTracking(
+                            trackedBundle);
+                }
                 m_AssetBundle = null;
             }
 #else

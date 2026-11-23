@@ -1,4 +1,35 @@
 mergeInto(LibraryManager.library, {
+	TTSDKRegisterUnityFirstFrameReporter: function () {
+		try {
+			if (typeof Module === "object" && Module) {
+				Module.__ttHasFirstFrameReporter = true;
+			}
+		} catch (e) {
+			// Older host plugins retain their mainCalled + rAF fallback.
+		}
+	},
+	TTSDKNotifyUnityFirstFrameRendered: function () {
+		try {
+			var root =
+				typeof globalThis !== "undefined"
+					? globalThis
+					: typeof GameGlobal !== "undefined"
+						? GameGlobal
+						: null;
+			var notify =
+				root && root.__ttNotifyUnityFirstFrameRendered;
+			if (typeof notify === "function") {
+				var attemptId =
+					typeof Module === "object" && Module
+						? Module.__ttFirstFrameAttemptId
+						: undefined;
+				notify("unity-wait-for-end-of-frame", attemptId);
+			}
+		} catch (e) {
+			// The JS-side rAF fallback remains active. Reporting must never
+			// affect the Unity player loop.
+		}
+	},
 	StarkMigratingData: function () {
 		if (!window.StarkSDK) return false;
 		return window.StarkSDK.MigratingData();
@@ -111,6 +142,11 @@ mergeInto(LibraryManager.library, {
 		if (window.StarkSDK) window.StarkSDK.ShareFileBuffer(
 			HEAPU8,
 			offset,
+			_StarkPointerStringify(callbackId)
+		);
+	},
+	StarkDiscardFileBuffer: function (callbackId) {
+		if (window.StarkSDK) window.StarkSDK.DiscardFileBuffer(
 			_StarkPointerStringify(callbackId)
 		);
 	},

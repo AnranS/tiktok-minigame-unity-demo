@@ -348,7 +348,6 @@ namespace TTSDK
         /// 读取文件描述信息（同步）
         /// </summary>
         /// <param name="path">文件/目录路径</param>
-        /// <param name="recursive">是否递归获取目录下的每个文件的 Stat 信息	</param>
         /// <param name="throwException">是否抛出错误信息，如果抛出错误信息，当文件不存在时则会抛出异常，错误信息从异常中获取。</param>
         /// <returns>返回文件信息，如果访问失败则返回null</returns>
         public override TTStatInfo StatSync(string path, bool throwException = false)

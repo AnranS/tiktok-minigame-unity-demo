@@ -2,6 +2,8 @@ using System;
 using System.IO;
 using TikTokMiniGameDemo;
 using UnityEditor;
+using UnityEditor.Build;
+using UnityEditor.Build.Reporting;
 using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -20,7 +22,7 @@ namespace TikTokMiniGameDemo.EditorTools
     /// </summary>
     public static class DemoSceneBuilder
     {
-        private const string ScenePath = "Assets/Demo/Scenes/MainMenu.unity";
+        public const string ScenePath = "Assets/Demo/Scenes/MainMenu.unity";
 
         /// <summary>
         /// Build the demo scene in memory, save it to disk and register it as build scene #0.
@@ -91,7 +93,9 @@ namespace TikTokMiniGameDemo.EditorTools
             var btnContent = btnScroll.GetComponent<ScrollRect>().content;
             var vlg = btnContent.gameObject.AddComponent<VerticalLayoutGroup>();
             vlg.spacing = 12;
-            vlg.padding = new RectOffset(12, 12, 12, 12);
+            // EN: Extra bottom clearance so the last category can scroll fully above LogScroll.
+            // ZH: 底部留足间距，确保最后一个分类也能完整滚动到日志面板上方。
+            vlg.padding = new RectOffset(12, 12, 12, 120);
             vlg.childControlWidth = true;
             vlg.childControlHeight = false;
             vlg.childForceExpandWidth = true;
@@ -344,6 +348,78 @@ namespace TikTokMiniGameDemo.EditorTools
             rt.anchorMin = min;
             rt.anchorMax = max;
             rt.pivot = pivot;
+        }
+
+        /// <summary>
+        /// Sync the serialized <see cref="DemoMainMenu.PackageVersion"/> in <c>MainMenu.unity</c>
+        /// with <c>Assets/Plugins/com.tiktok.minigame/package.json</c> without rebuilding the UI.
+        /// 在不重建 UI 的前提下，把场景里序列化的 <see cref="DemoMainMenu.PackageVersion"/>
+        /// 同步为当前导入 SDK 的版本号。
+        /// </summary>
+        internal static bool SyncPackageVersionInScene()
+        {
+            string expectedVersion = ReadSdkPackageVersion();
+            if (expectedVersion == "?" || !File.Exists(ScenePath)) return false;
+
+            Scene scene = SceneManager.GetSceneByPath(ScenePath);
+            bool openedForSync = !scene.IsValid() || !scene.isLoaded;
+            Scene previousActiveScene = SceneManager.GetActiveScene();
+
+            try
+            {
+                if (openedForSync)
+                {
+                    scene = EditorSceneManager.OpenScene(ScenePath, OpenSceneMode.Additive);
+                }
+
+                DemoMainMenu controller = null;
+                foreach (GameObject root in scene.GetRootGameObjects())
+                {
+                    controller = root.GetComponentInChildren<DemoMainMenu>(true);
+                    if (controller != null) break;
+                }
+                if (controller == null) return false;
+                if (string.Equals(controller.PackageVersion, expectedVersion, StringComparison.Ordinal))
+                    return false;
+
+                controller.PackageVersion = expectedVersion;
+                EditorUtility.SetDirty(controller);
+                EditorSceneManager.MarkSceneDirty(scene);
+                EditorSceneManager.SaveScene(scene, ScenePath);
+                return true;
+            }
+            finally
+            {
+                if (openedForSync && scene.IsValid() && scene.isLoaded)
+                {
+                    EditorSceneManager.CloseScene(scene, true);
+                }
+                if (previousActiveScene.IsValid() && previousActiveScene.isLoaded)
+                {
+                    SceneManager.SetActiveScene(previousActiveScene);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Ensures the displayed SDK version stays aligned with <c>package.json</c> before player builds.
+    /// 构建前兜底同步场景里展示的 SDK 版本号与 <c>package.json</c> 一致。
+    /// </summary>
+    internal sealed class DemoPackageVersionBuildPreprocessor : IPreprocessBuildWithReport
+    {
+        public int callbackOrder => -1000;
+
+        public void OnPreprocessBuild(BuildReport report)
+        {
+            foreach (EditorBuildSettingsScene scene in EditorBuildSettings.scenes)
+            {
+                if (scene.enabled && scene.path == DemoSceneBuilder.ScenePath)
+                {
+                    DemoSceneBuilder.SyncPackageVersionInScene();
+                    break;
+                }
+            }
         }
     }
 }

@@ -1,139 +1,338 @@
 ﻿using System;
-using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Threading;
 using UnityEngine;
 
 namespace TTSDK
 {
-    struct TTCallbackKeyPair
+    internal struct TTCallbackKeyPair
     {
         public string success;
         public string fail;
     }
-    
-    class TTCallbackKeyPairDictionary<T>
-    {
-        private readonly Dictionary<T, T> k2v = new Dictionary<T, T>();
-        private readonly Dictionary<T, T> v2k = new Dictionary<T, T>();
 
-        public void Add(T key, T value)
+    internal sealed class TTCallbackKeyPairDictionary<T>
+    {
+        private readonly Dictionary<T, T> _keyToValue =
+            new Dictionary<T, T>();
+        private readonly Dictionary<T, T> _valueToKey =
+            new Dictionary<T, T>();
+
+        internal void Add(T key, T value)
         {
-            if (k2v.ContainsKey(key) || v2k.ContainsKey(key))
+            if (_keyToValue.ContainsKey(key) ||
+                _valueToKey.ContainsKey(key) ||
+                _keyToValue.ContainsKey(value) ||
+                _valueToKey.ContainsKey(value))
             {
                 throw new ArgumentException("Duplicate key or value.");
             }
-            
-            k2v.Add(key, value);
-            v2k.Add(value, key);
+
+            _keyToValue.Add(key, value);
+            _valueToKey.Add(value, key);
         }
 
-        public bool Remove(T key)
+        internal bool Remove(T key)
         {
-            // Due to old compiler version, cannot simplify it.
-            if (k2v.TryGetValue(key, out var value))
+            if (_keyToValue.TryGetValue(key, out T value))
             {
-                k2v.Remove(key);
-                v2k.Remove(value);
+                _keyToValue.Remove(key);
+                _valueToKey.Remove(value);
                 return true;
             }
 
-            if (v2k.TryGetValue(key, out value))
+            if (_valueToKey.TryGetValue(key, out value))
             {
-                v2k.Remove(key);
-                k2v.Remove(value);
+                _valueToKey.Remove(key);
+                _keyToValue.Remove(value);
                 return true;
             }
 
             return false;
         }
 
-        public bool TryGetValue(T key, out T value)
+        internal bool TryGetValue(T key, out T value)
         {
-            return k2v.TryGetValue(key, out value) || v2k.TryGetValue(key, out value);
+            return _keyToValue.TryGetValue(key, out value) ||
+                   _valueToKey.TryGetValue(key, out value);
+        }
+
+        internal void Clear()
+        {
+            _keyToValue.Clear();
+            _valueToKey.Clear();
         }
     }
-    
-    class TTCallbackHandler
+
+    /// <summary>
+    /// Owns direct jslib callbacks. IDs are process-monotonic, terminal
+    /// responses claim state before user code, and missing host responses are
+    /// evicted after a bounded timeout.
+    /// </summary>
+    internal static class TTCallbackHandler
     {
-        private static readonly Hashtable responseHT = new Hashtable();
+        internal const long DefaultTimeoutMilliseconds = 120000;
 
-        private static readonly TTCallbackKeyPairDictionary<string> keyPairs = new TTCallbackKeyPairDictionary<string>();
-
-        private static int htCounter = 0;
-
-        private static int GenarateCallbackId()
+        private sealed class PendingCallback
         {
-            if (htCounter > 1000000)
-            {
-                htCounter = 0;
-            }
-
-            htCounter++;
-            return htCounter;
+            internal Delegate Callback;
+            internal long DeadlineMilliseconds;
+            internal Action OnTimeout;
         }
-        
-        public static TTCallbackKeyPair AddPair<T>(Action<T> success, Action<T> fail)
+
+        private static readonly object CallbackLock = new object();
+        private static readonly Dictionary<string, PendingCallback>
+            responseCallbacks =
+                new Dictionary<string, PendingCallback>();
+        private static readonly TTCallbackKeyPairDictionary<string> KeyPairs =
+            new TTCallbackKeyPairDictionary<string>();
+        private static readonly System.Diagnostics.Stopwatch CallbackClock =
+            System.Diagnostics.Stopwatch.StartNew();
+
+        private static long _nextCallbackId;
+        private static long _timeoutMilliseconds =
+            DefaultTimeoutMilliseconds;
+
+        internal static int Count
+        {
+            get
+            {
+                lock (CallbackLock)
+                {
+                    return responseCallbacks.Count;
+                }
+            }
+        }
+
+        internal static TTCallbackKeyPair AddPair<T>(
+            Action<T> success,
+            Action<T> fail)
             where T : TTBaseResponse
         {
-            var res = new TTCallbackKeyPair
+            lock (CallbackLock)
             {
-                success = Add(success),
-                fail = Add(fail)
-            };
-            
-            keyPairs.Add(res.success, res.fail);
-            return res;
+                Action timeout = fail == null
+                    ? null
+                    : () => InvokeTimeout(fail);
+                var result = new TTCallbackKeyPair
+                {
+                    success = AddLocked(success, timeout),
+                    fail = AddLocked(fail, timeout)
+                };
+
+                // Empty IDs represent missing optional callbacks and must not
+                // enter the bidirectional pair map.
+                if (!string.IsNullOrEmpty(result.success) &&
+                    !string.IsNullOrEmpty(result.fail))
+                {
+                    KeyPairs.Add(result.success, result.fail);
+                }
+                return result;
+            }
         }
 
-        public static string Add<T>(Action<T> callback) where T : TTBaseResponse
+        internal static string Add<T>(Action<T> callback)
+            where T : TTBaseResponse
+        {
+            lock (CallbackLock)
+            {
+                return AddLocked(callback, null);
+            }
+        }
+
+        private static string AddLocked(Delegate callback, Action onTimeout)
         {
             if (callback == null)
             {
-                return "";
+                return string.Empty;
             }
-            var key = MakeKey();
-            responseHT.Add(key, callback);
+
+            string key = MakeKey();
+            responseCallbacks.Add(
+                key,
+                new PendingCallback
+                {
+                    Callback = callback,
+                    DeadlineMilliseconds = checked(
+                        CallbackClock.ElapsedMilliseconds +
+                        _timeoutMilliseconds),
+                    OnTimeout = onTimeout
+                });
             return key;
         }
 
-        public static string MakeKey()
+        internal static string MakeKey()
         {
-            int id = GenarateCallbackId();
-            TimeSpan ts = DateTime.Now - new DateTime(1970, 1, 1, 0, 0, 0, 0);
-            var timestamp = Convert.ToInt64(ts.TotalSeconds);
-            var key = timestamp.ToString() + '-' + id;
-            return key;
+            long id = Interlocked.Increment(ref _nextCallbackId);
+            return "tt-" + id.ToString(CultureInfo.InvariantCulture);
         }
 
-        public static void InvokeResponseCallback<T>(string str) where T : TTBaseResponse
+        internal static void InvokeResponseCallback<T>(string json)
+            where T : TTBaseResponse
         {
-            if (!string.IsNullOrEmpty(str))
+            if (string.IsNullOrEmpty(json))
             {
-                T res = JsonUtility.FromJson<T>(str);
-                var id = res.callbackId;
+                return;
+            }
 
-                Callback(id, res);
+            T response = JsonUtility.FromJson<T>(json);
+            Callback(response.callbackId, response);
+        }
+
+        internal static void Callback<T>(string id, T response)
+        {
+            if (string.IsNullOrEmpty(id))
+            {
+                Debug.LogError("callback id is empty");
+                return;
+            }
+
+            PendingCallback pending;
+            lock (CallbackLock)
+            {
+                if (!responseCallbacks.TryGetValue(id, out pending))
+                {
+                    Debug.LogError($"callback id not found, id: {id}");
+                    return;
+                }
+
+                // Claim both arms before invoking user code so response,
+                // timeout and re-entry have exactly one winner.
+                responseCallbacks.Remove(id);
+                if (KeyPairs.TryGetValue(id, out string pairId))
+                {
+                    KeyPairs.Remove(id);
+                    responseCallbacks.Remove(pairId);
+                }
+            }
+
+            if (pending.Callback is Action<T> callback)
+            {
+                callback(response);
+                return;
+            }
+
+            Debug.LogError(
+                $"callback type mismatch, id: {id}, expected: {typeof(T)}");
+        }
+
+        internal static int PollTimeouts()
+        {
+            return PollTimeouts(CallbackClock.ElapsedMilliseconds);
+        }
+
+        internal static int PollTimeouts(long nowMilliseconds)
+        {
+            List<PendingCallback> expired = null;
+            lock (CallbackLock)
+            {
+                List<string> expiredIds = null;
+                foreach (KeyValuePair<string, PendingCallback> entry in
+                         responseCallbacks)
+                {
+                    if (entry.Value.DeadlineMilliseconds > nowMilliseconds)
+                    {
+                        continue;
+                    }
+
+                    expiredIds ??= new List<string>();
+                    expiredIds.Add(entry.Key);
+                }
+
+                if (expiredIds == null)
+                {
+                    return 0;
+                }
+
+                expired = new List<PendingCallback>(expiredIds.Count);
+                foreach (string id in expiredIds)
+                {
+                    if (!responseCallbacks.TryGetValue(
+                            id,
+                            out PendingCallback pending))
+                    {
+                        continue;
+                    }
+
+                    responseCallbacks.Remove(id);
+                    if (KeyPairs.TryGetValue(id, out string pairId))
+                    {
+                        KeyPairs.Remove(id);
+                        responseCallbacks.Remove(pairId);
+                    }
+                    expired.Add(pending);
+                }
+            }
+
+            foreach (PendingCallback pending in expired)
+            {
+                try
+                {
+                    pending.OnTimeout?.Invoke();
+                }
+                catch (Exception exception)
+                {
+                    Debug.LogError(
+                        "direct jslib timeout callback exception: " +
+                        exception);
+                }
+            }
+            return expired.Count;
+        }
+
+        internal static void ClearPendingCallbacks()
+        {
+            lock (CallbackLock)
+            {
+                responseCallbacks.Clear();
+                KeyPairs.Clear();
             }
         }
 
-        public static void Callback<T>(string id, T res)
+        internal static void SetTimeoutForTests(long timeoutMilliseconds)
         {
-            if (responseHT.ContainsKey(id))
+            if (timeoutMilliseconds <= 0)
             {
-                var callback = (Action<T>) responseHT[id];
-                callback(res);
-                responseHT.Remove(id);
-            }
-            else
-            {
-                Debug.LogError($"callback id not found, id: {id}");
+                throw new ArgumentOutOfRangeException(
+                    nameof(timeoutMilliseconds));
             }
 
-            if (keyPairs.TryGetValue(id, out var pairId))
+            lock (CallbackLock)
             {
-                keyPairs.Remove(id);
-                responseHT.Remove(pairId);
+                _timeoutMilliseconds = timeoutMilliseconds;
             }
+        }
+
+        internal static void ResetForTests()
+        {
+            lock (CallbackLock)
+            {
+                responseCallbacks.Clear();
+                KeyPairs.Clear();
+                _timeoutMilliseconds = DefaultTimeoutMilliseconds;
+            }
+        }
+
+        private static void InvokeTimeout<T>(Action<T> fail)
+            where T : TTBaseResponse
+        {
+            T response;
+            try
+            {
+                response = (T)Activator.CreateInstance(typeof(T));
+            }
+            catch (Exception exception)
+            {
+                Debug.LogError(
+                    $"Cannot create timeout response {typeof(T)}: " +
+                    exception);
+                return;
+            }
+
+            response.errCode = -1;
+            response.errMsg = "callback timeout";
+            fail(response);
         }
     }
 }

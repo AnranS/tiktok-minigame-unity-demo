@@ -99,6 +99,15 @@ namespace TTSDK
 
 #if UNITY_WEBGL && !UNITY_EDITOR
         [DllImport("__Internal")]
+        private static extern void StarkDiscardFileBuffer(string callbackId);
+#else
+        private static void StarkDiscardFileBuffer(string callbackId)
+        {
+        }
+#endif
+
+#if UNITY_WEBGL && !UNITY_EDITOR
+        [DllImport("__Internal")]
         private static extern bool StarkAccessFileSync(string filePath);
 #else
         private static bool StarkAccessFileSync(string filePath)
@@ -409,6 +418,156 @@ namespace TTSDK
         private static Dictionary<string, FstatParam> s_fstatParams = new();
         #endregion
 
+        private sealed class PendingFileSystemCallback
+        {
+            internal long DeadlineMilliseconds;
+            internal Func<bool> RemoveCallback;
+            internal Action OnTimeout;
+        }
+
+        private static readonly object s_pendingCallbackLock = new object();
+        private static readonly Dictionary<string, PendingFileSystemCallback>
+            s_pendingCallbacks =
+                new Dictionary<string, PendingFileSystemCallback>();
+        private static readonly System.Diagnostics.Stopwatch s_callbackClock =
+            System.Diagnostics.Stopwatch.StartNew();
+
+        private static void RegisterPendingCallback<TParam>(
+            Dictionary<string, TParam> callbacks,
+            string callbackId,
+            TParam callback,
+            Action<TParam> onTimeout)
+            where TParam : class
+        {
+            if (callback == null)
+            {
+                throw new ArgumentNullException(nameof(callback));
+            }
+
+            lock (s_pendingCallbackLock)
+            {
+                callbacks.Add(callbackId, callback);
+                s_pendingCallbacks.Add(
+                    callbackId,
+                    new PendingFileSystemCallback
+                    {
+                        DeadlineMilliseconds = checked(
+                            s_callbackClock.ElapsedMilliseconds +
+                            TTCallbackHandler.DefaultTimeoutMilliseconds),
+                        RemoveCallback = () => callbacks.Remove(callbackId),
+                        OnTimeout = () => onTimeout?.Invoke(callback)
+                    });
+            }
+        }
+
+        private static bool TryTakePendingCallback<TParam>(
+            Dictionary<string, TParam> callbacks,
+            string callbackId,
+            out TParam callback)
+            where TParam : class
+        {
+            lock (s_pendingCallbackLock)
+            {
+                if (string.IsNullOrEmpty(callbackId) ||
+                    !callbacks.TryGetValue(callbackId, out callback))
+                {
+                    callback = null;
+                    return false;
+                }
+
+                callbacks.Remove(callbackId);
+                s_pendingCallbacks.Remove(callbackId);
+                return callback != null;
+            }
+        }
+
+        private static void RemovePendingCallback<TParam>(
+            Dictionary<string, TParam> callbacks,
+            string callbackId)
+            where TParam : class
+        {
+            lock (s_pendingCallbackLock)
+            {
+                callbacks.Remove(callbackId);
+                s_pendingCallbacks.Remove(callbackId);
+            }
+        }
+
+        internal static int PollPendingFileSystemCallbacks(
+            long nowMilliseconds)
+        {
+            List<Action> timeouts = null;
+            lock (s_pendingCallbackLock)
+            {
+                List<string> expiredIds = null;
+                foreach (KeyValuePair<string, PendingFileSystemCallback> entry
+                         in s_pendingCallbacks)
+                {
+                    if (entry.Value.DeadlineMilliseconds > nowMilliseconds)
+                    {
+                        continue;
+                    }
+
+                    expiredIds ??= new List<string>();
+                    expiredIds.Add(entry.Key);
+                }
+
+                if (expiredIds == null)
+                {
+                    return 0;
+                }
+
+                timeouts = new List<Action>(expiredIds.Count);
+                foreach (string callbackId in expiredIds)
+                {
+                    if (!s_pendingCallbacks.TryGetValue(
+                            callbackId,
+                            out PendingFileSystemCallback pending))
+                    {
+                        continue;
+                    }
+
+                    s_pendingCallbacks.Remove(callbackId);
+                    if (pending.RemoveCallback())
+                    {
+                        timeouts.Add(pending.OnTimeout);
+                    }
+                }
+            }
+
+            foreach (Action timeout in timeouts)
+            {
+                try
+                {
+                    timeout?.Invoke();
+                }
+                catch (Exception exception)
+                {
+                    Debug.LogError(
+                        "file-system timeout callback exception: " +
+                        exception);
+                }
+            }
+            return timeouts.Count;
+        }
+
+        private static void ClearPendingFileSystemCallbacks()
+        {
+            lock (s_pendingCallbackLock)
+            {
+                s_readFileParams.Clear();
+                s_statParams.Clear();
+                s_getSavedFileListParams.Clear();
+                s_readDirParams.Clear();
+                s_openParams.Clear();
+                s_writeParams.Clear();
+                s_readParams.Clear();
+                s_readCompressedFileParams.Clear();
+                s_fstatParams.Clear();
+                s_pendingCallbacks.Clear();
+            }
+        }
+
         private static bool _initialized;
 
         public TTFileSystemManagerWebGL()
@@ -431,6 +590,49 @@ namespace TTSDK
 
         public class TTFileSystemHandler : MonoBehaviour
         {
+            private float _nextTimeoutPoll;
+
+            private static bool TryTakeCallback<TParam>(
+                Dictionary<string, TParam> callbacks,
+                string callbackId,
+                string handlerName,
+                out TParam callback)
+                where TParam : class
+            {
+                if (!TryTakePendingCallback(
+                        callbacks,
+                        callbackId,
+                        out callback))
+                {
+                    Debug.LogWarning(
+                        $"{handlerName} - no callback for callbackId: " +
+                        callbackId);
+                    return false;
+                }
+
+                return true;
+            }
+
+            private void Update()
+            {
+                if (Time.realtimeSinceStartup < _nextTimeoutPoll)
+                {
+                    return;
+                }
+
+                _nextTimeoutPoll = Time.realtimeSinceStartup + 1f;
+                TTCallbackHandler.PollTimeouts();
+                PollPendingFileSystemCallbacks(
+                    s_callbackClock.ElapsedMilliseconds);
+            }
+
+            private void OnDestroy()
+            {
+                _initialized = false;
+                TTCallbackHandler.ClearPendingCallbacks();
+                ClearPendingFileSystemCallbacks();
+            }
+
             private void SafeHandle(string handlerName, string msg, Action<string> action)
             {
                 try
@@ -452,19 +654,36 @@ namespace TTSDK
             public void HandleReadFileCallback(string msg) => SafeHandle(nameof(HandleReadFileCallback), msg, m =>
             {
                 var res = JsonUtility.FromJson<TTReadFileCallback>(m);
-                var conf = s_readFileParams[res.callbackId];
-                if (conf == null)
+                if (res == null)
                 {
-                    Debug.LogWarning($"HandleReadFileCallback - no callback for callbackId: {res.callbackId}");
+                    Debug.LogWarning("HandleReadFileCallback - empty response");
                     return;
                 }
 
-                s_readFileParams.Remove(res.callbackId);
+                if (!TryTakeCallback(
+                        s_readFileParams,
+                        res.callbackId,
+                        nameof(HandleReadFileCallback),
+                        out ReadFileParam conf))
+                {
+                    StarkDiscardFileBuffer(res.callbackId);
+                    return;
+                }
 
                 if (res.errCode == 0)
                 {
                     if (string.IsNullOrEmpty(conf.encoding) || conf.encoding.Equals("binary"))
                     {
+                        if (res.byteLength < 0)
+                        {
+                            StarkDiscardFileBuffer(res.callbackId);
+                            conf.fail?.Invoke(new TTReadFileResponse
+                            {
+                                errCode = -1,
+                                errMsg = "invalid binary response length"
+                            });
+                            return;
+                        }
                         var sharedBuffer = new byte[res.byteLength];
                         StarkShareFileBuffer(sharedBuffer, res.callbackId);
                         var obj = new TTReadFileResponse()
@@ -501,14 +720,12 @@ namespace TTSDK
                     Debug.LogError("empty response");
                     return;
                 }
-                var conf = s_statParams[res.callbackId];
-                if (conf == null)
-                {
-                    Debug.LogWarning($"HandleStatCallback - no callback for callbackId: {res.callbackId}");
+                if (!TryTakeCallback(
+                        s_statParams,
+                        res.callbackId,
+                        nameof(HandleStatCallback),
+                        out StatParam conf))
                     return;
-                }
-
-                s_statParams.Remove(res.callbackId);
 
                 if (res.errCode == 0)
                 {
@@ -534,14 +751,12 @@ namespace TTSDK
                     Debug.LogError("empty response");
                     return;
                 }
-                var conf = s_getSavedFileListParams[res.callbackId];
-                if (conf == null)
-                {
-                    Debug.LogWarning($"HandleGetSavedFileListCallback - no callback for callbackId: {res.callbackId}");
+                if (!TryTakeCallback(
+                        s_getSavedFileListParams,
+                        res.callbackId,
+                        nameof(HandleGetSavedFileListCallback),
+                        out GetSavedFileListParam conf))
                     return;
-                }
-
-                s_getSavedFileListParams.Remove(res.callbackId);
 
                 if (res.errCode == 0)
                 {
@@ -567,13 +782,12 @@ namespace TTSDK
                     Debug.LogError("empty response");
                     return;
                 }
-                var conf = s_readDirParams[res.callbackId];
-                if (conf == null)
-                {
-                    Debug.LogWarning($"HandleReadDirCallback - no callback for callbackId: {res.callbackId}");
-                    return;     
-                }
-                s_readDirParams.Remove(res.callbackId);
+                if (!TryTakeCallback(
+                        s_readDirParams,
+                        res.callbackId,
+                        nameof(HandleReadDirCallback),
+                        out ReadDirParam conf))
+                    return;
                 if (res.errCode == 0)
                 {
                     if (res.files == null)
@@ -593,14 +807,18 @@ namespace TTSDK
             public void HandleFOpenCallback(string msg) => SafeHandle(nameof(HandleFOpenCallback), msg, m =>
             {
                 var res = JsonUtility.FromJson<TTOpenResponse>(m);
-                var conf = s_openParams[res.callbackId];
-                if (conf == null)
+                if (res == null)
                 {
-                    Debug.LogWarning($"HandleFOpenCallback - no callback for callbackId: {res.callbackId}");
+                    Debug.LogWarning("HandleFOpenCallback - empty response");
                     return;
                 }
 
-                s_openParams.Remove(res.callbackId);
+                if (!TryTakeCallback(
+                        s_openParams,
+                        res.callbackId,
+                        nameof(HandleFOpenCallback),
+                        out OpenParam conf))
+                    return;
 
                 if (res.errCode == 0)
                 {
@@ -615,14 +833,18 @@ namespace TTSDK
             public void HandleFWriteCallback(string msg) => SafeHandle(nameof(HandleFWriteCallback), msg, m =>
             {
                 var res = JsonUtility.FromJson<TTWriteResponse>(m);
-                var conf = s_writeParams[res.callbackId];
-                if (conf == null)
+                if (res == null)
                 {
-                    Debug.LogWarning($"HandleFWriteCallback - no callback for callbackId: {res.callbackId}");
+                    Debug.LogWarning("HandleFWriteCallback - empty response");
                     return;
                 }
 
-                s_writeParams.Remove(res.callbackId);
+                if (!TryTakeCallback(
+                        s_writeParams,
+                        res.callbackId,
+                        nameof(HandleFWriteCallback),
+                        out WriteParam conf))
+                    return;
 
                 if (res.errCode == 0)
                 {
@@ -637,14 +859,21 @@ namespace TTSDK
             public void HandleFReadCallback(string msg) => SafeHandle(nameof(HandleFReadCallback), msg, m =>
             {
                 var res = JsonUtility.FromJson<TTReadResponse>(m);
-                var conf = s_readParams[res.callbackId];
-                if (conf == null)
+                if (res == null)
                 {
-                    Debug.LogWarning($"HandleFReadCallback - no callback for callbackId: {res.callbackId}");
+                    Debug.LogWarning("HandleFReadCallback - empty response");
                     return;
                 }
 
-                s_readParams.Remove(res.callbackId);
+                if (!TryTakeCallback(
+                        s_readParams,
+                        res.callbackId,
+                        nameof(HandleFReadCallback),
+                        out ReadParam conf))
+                {
+                    StarkDiscardFileBuffer(res.callbackId);
+                    return;
+                }
                 res.bytesRead = Math.Max(res.bytesRead, 0);
 
                 if (res.errCode == 0)
@@ -662,17 +891,35 @@ namespace TTSDK
             public void HandleFReadCompressedFileCallback(string msg) => SafeHandle(nameof(HandleFReadCompressedFileCallback), msg, m =>
             {
                 var res = JsonUtility.FromJson<TTReadCompressedCallback>(m);
-                var conf = s_readCompressedFileParams[res.callbackId];
-                if (conf == null)
+                if (res == null)
                 {
-                    Debug.LogWarning($"HandleFReadCompressedFileCallback - no callback for callbackId: {res.callbackId}");
+                    Debug.LogWarning(
+                        "HandleFReadCompressedFileCallback - empty response");
                     return;
                 }
 
-                s_readCompressedFileParams.Remove(res.callbackId);
+                if (!TryTakeCallback(
+                        s_readCompressedFileParams,
+                        res.callbackId,
+                        nameof(HandleFReadCompressedFileCallback),
+                        out ReadCompressedFileParam conf))
+                {
+                    StarkDiscardFileBuffer(res.callbackId);
+                    return;
+                }
 
                 if (res.errCode == 0)
                 {
+                    if (res.byteLength < 0)
+                    {
+                        StarkDiscardFileBuffer(res.callbackId);
+                        conf.fail?.Invoke(new TTReadCompressedFileResponse
+                        {
+                            errCode = -1,
+                            errMsg = "invalid compressed response length"
+                        });
+                        return;
+                    }
                     var sharedBuffer = new byte[res.byteLength];
                     StarkShareFileBuffer(sharedBuffer, res.callbackId);
                     var obj = new TTReadCompressedFileResponse()
@@ -695,14 +942,18 @@ namespace TTSDK
             public void HandleFStatCallback(string msg) => SafeHandle(nameof(HandleFStatCallback), msg, m =>
             {
                 var res = JsonMapper.ToObject<FstatResponse>(m);
-                var conf = s_fstatParams[res.callbackId];
-                if (conf == null)
+                if (res == null)
                 {
-                    Debug.LogWarning($"HandleFStatCallback - no callback for callbackId: {res.callbackId}");
+                    Debug.LogWarning("HandleFStatCallback - empty response");
                     return;
                 }
 
-                s_fstatParams.Remove(res.callbackId);
+                if (!TryTakeCallback(
+                        s_fstatParams,
+                        res.callbackId,
+                        nameof(HandleFStatCallback),
+                        out FstatParam conf))
+                    return;
 
                 if (res.errCode == 0)
                 {
@@ -789,8 +1040,28 @@ namespace TTSDK
         public override void ReadFile(ReadFileParam param)
         {
             var key = TTCallbackHandler.MakeKey();
-            s_readFileParams.Add(key, param);
-            StarkReadFile(FixFilePath(param.filePath), param.encoding, key);
+            RegisterPendingCallback(
+                s_readFileParams,
+                key,
+                param,
+                pending => pending.fail?.Invoke(
+                    new TTReadFileResponse
+                    {
+                        errCode = -1,
+                        errMsg = "callback timeout"
+                    }));
+            try
+            {
+                StarkReadFile(
+                    FixFilePath(param.filePath),
+                    param.encoding,
+                    key);
+            }
+            catch
+            {
+                RemovePendingCallback(s_readFileParams, key);
+                throw;
+            }
         }
 
         /// <summary>
@@ -959,7 +1230,6 @@ namespace TTSDK
         /// 读取文件描述信息（同步）
         /// </summary>
         /// <param name="path">文件/目录路径</param>
-        /// <param name="recursive">是否递归获取目录下的每个文件的 Stat 信息	</param>
         /// <param name="throwException">是否抛出错误信息，如果抛出错误信息，当文件不存在时则会抛出异常，错误信息从异常中获取。</param>
         /// <returns>返回文件信息，如果访问失败则返回null</returns>
         public override TTStatInfo StatSync(string path, bool throwException = false)
@@ -992,8 +1262,26 @@ namespace TTSDK
         public override void Stat(StatParam param)
         {
             var key = TTCallbackHandler.MakeKey();
-            s_statParams.Add(key, param);
-            StarkStat(FixFilePath(param.path), key);
+            RegisterPendingCallback(
+                s_statParams,
+                key,
+                param,
+                pending => pending.fail?.Invoke(
+                    new TTStatResponse
+                    {
+                        errCode = -1,
+                        errMsg = "callback timeout",
+                        stat = new TTStatInfo()
+                    }));
+            try
+            {
+                StarkStat(FixFilePath(param.path), key);
+            }
+            catch
+            {
+                RemovePendingCallback(s_statParams, key);
+                throw;
+            }
         }
 
         /// <summary>
@@ -1003,8 +1291,26 @@ namespace TTSDK
         public override void GetSavedFileList(GetSavedFileListParam param)
         {
             var key = TTCallbackHandler.MakeKey();
-            s_getSavedFileListParams.Add(key, param);
-            StarkGetSavedFileList(key);
+            RegisterPendingCallback(
+                s_getSavedFileListParams,
+                key,
+                param,
+                pending => pending.fail?.Invoke(
+                    new TTGetSavedFileListResponse
+                    {
+                        errCode = -1,
+                        errMsg = "callback timeout",
+                        fileList = Array.Empty<TTFileInfo>()
+                    }));
+            try
+            {
+                StarkGetSavedFileList(key);
+            }
+            catch
+            {
+                RemovePendingCallback(s_getSavedFileListParams, key);
+                throw;
+            }
         }
         
         /// <summary>
@@ -1014,7 +1320,20 @@ namespace TTSDK
         /// <returns>返回本地缓存文件路径，以scfile://user开头的路径，可以直接用这个路径访问该文件</returns>
         public override string GetLocalCachedPathForUrl(string url)
         {
-            return StarkGetCachedPathForUrl(url);
+            string path = StarkGetCachedPathForUrl(url);
+            const string nativeUserDataPath = "ttfile://user";
+            if (path == nativeUserDataPath)
+            {
+                return USER_DATA_PATH;
+            }
+            if (path != null && path.StartsWith(
+                    nativeUserDataPath + "/",
+                    StringComparison.Ordinal))
+            {
+                return USER_DATA_PATH + path.Substring(
+                    nativeUserDataPath.Length);
+            }
+            return path;
         }
 
         /// <summary>
@@ -1071,10 +1390,28 @@ namespace TTSDK
         public override void ReadDir(ReadDirParam param)
         {
             var key = TTCallbackHandler.MakeKey();
-            s_readDirParams.Add(key, param);
-            StarkReadDir(
-                FixFilePath(param.DirPath),
-                key);
+            RegisterPendingCallback(
+                s_readDirParams,
+                key,
+                param,
+                pending => pending.fail?.Invoke(
+                    new TTReadDirResponse
+                    {
+                        errCode = -1,
+                        errMsg = "callback timeout",
+                        files = Array.Empty<string>()
+                    }));
+            try
+            {
+                StarkReadDir(
+                    FixFilePath(param.DirPath),
+                    key);
+            }
+            catch
+            {
+                RemovePendingCallback(s_readDirParams, key);
+                throw;
+            }
         }
 
         public override string[] ReadDirSync(string dirPath)
@@ -1115,8 +1452,28 @@ namespace TTSDK
         public override void Open(OpenParam param)
         {
             var key = TTCallbackHandler.MakeKey();
-            s_openParams.Add(key, param);
-            TT_FOpenFile(FixFilePath(param.filePath), param.flag, key);
+            RegisterPendingCallback(
+                s_openParams,
+                key,
+                param,
+                pending => pending.fail?.Invoke(
+                    new TTOpenResponse
+                    {
+                        errCode = -1,
+                        errMsg = "callback timeout"
+                    }));
+            try
+            {
+                TT_FOpenFile(
+                    FixFilePath(param.filePath),
+                    param.flag,
+                    key);
+            }
+            catch
+            {
+                RemovePendingCallback(s_openParams, key);
+                throw;
+            }
         }
 
         public override string OpenSync(OpenSyncParam param)
@@ -1147,17 +1504,62 @@ namespace TTSDK
         public override void Write(WriteBinParam param)
         {
             var key = TTCallbackHandler.MakeKey();
-            s_writeParams.Add(key, param);
+            RegisterPendingCallback(
+                s_writeParams,
+                key,
+                param,
+                pending => pending.fail?.Invoke(
+                    new TTWriteResponse
+                    {
+                        errCode = -1,
+                        errMsg = "callback timeout"
+                    }));
             int length = param.length == null ? -1 : Math.Max(param.length.Value, 0);
             int position = param.position == null ? -1 : Math.Max(param.position.Value, -1);
-            TT_FWriteBinFile(param.fd, param.data, param.data.Length, param.offset, length, key, position);
+            try
+            {
+                TT_FWriteBinFile(
+                    param.fd,
+                    param.data,
+                    param.data.Length,
+                    param.offset,
+                    length,
+                    key,
+                    position);
+            }
+            catch
+            {
+                RemovePendingCallback(s_writeParams, key);
+                throw;
+            }
         }
 
         public override void Write(WriteStringParam param)
         {
             var key = TTCallbackHandler.MakeKey();
-            s_writeParams.Add(key, param);
-            TT_FWriteStringFile(param.fd, param.data, param.encoding, key);
+            RegisterPendingCallback(
+                s_writeParams,
+                key,
+                param,
+                pending => pending.fail?.Invoke(
+                    new TTWriteResponse
+                    {
+                        errCode = -1,
+                        errMsg = "callback timeout"
+                    }));
+            try
+            {
+                TT_FWriteStringFile(
+                    param.fd,
+                    param.data,
+                    param.encoding,
+                    key);
+            }
+            catch
+            {
+                RemovePendingCallback(s_writeParams, key);
+                throw;
+            }
         }
 
         public override WriteResult WriteSync(WriteBinSyncParam param)
@@ -1197,9 +1599,33 @@ namespace TTSDK
         public override void Read(ReadParam param)
         {
             var key = TTCallbackHandler.MakeKey();
-            s_readParams.Add(key, param);
+            RegisterPendingCallback(
+                s_readParams,
+                key,
+                param,
+                pending => pending.fail?.Invoke(
+                    new TTReadResponse
+                    {
+                        errCode = -1,
+                        errMsg = "callback timeout",
+                        arrayBuffer = pending.arrayBuffer
+                    }));
             int position = param.position == null ? -1 : Math.Max(param.position.Value, -1);
-            TT_FReadFile(param.fd, param.arrayBuffer.Length, param.offset, param.length, position, key);
+            try
+            {
+                TT_FReadFile(
+                    param.fd,
+                    param.arrayBuffer.Length,
+                    param.offset,
+                    param.length,
+                    position,
+                    key);
+            }
+            catch
+            {
+                RemovePendingCallback(s_readParams, key);
+                throw;
+            }
         }
 
         public override ReadResult ReadSync(ReadSyncParam param)
@@ -1226,8 +1652,30 @@ namespace TTSDK
         public override void ReadCompressedFile(ReadCompressedFileParam param)
         {
             var key = TTCallbackHandler.MakeKey();
-            s_readCompressedFileParams.Add(key, param);
-            TT_FReadCompressedFile(FixFilePath(param.filePath), param.compressionAlgorithm, key);
+            RegisterPendingCallback(
+                s_readCompressedFileParams,
+                key,
+                param,
+                pending => pending.fail?.Invoke(
+                    new TTReadCompressedFileResponse
+                    {
+                        errCode = -1,
+                        errMsg = "callback timeout"
+                    }));
+            try
+            {
+                TT_FReadCompressedFile(
+                    FixFilePath(param.filePath),
+                    param.compressionAlgorithm,
+                    key);
+            }
+            catch
+            {
+                RemovePendingCallback(
+                    s_readCompressedFileParams,
+                    key);
+                throw;
+            }
         }
 
         public override byte[] ReadCompressedFileSync(ReadCompressedFileSyncParam param)
@@ -1248,8 +1696,25 @@ namespace TTSDK
         public override void Fstat(FstatParam param)
         {
             var key = TTCallbackHandler.MakeKey();
-            s_fstatParams.Add(key, param);
-            TT_Fstat(param.fd, key);
+            RegisterPendingCallback(
+                s_fstatParams,
+                key,
+                param,
+                pending => pending.fail?.Invoke(
+                    new FstatResponse
+                    {
+                        errCode = -1,
+                        errMsg = "callback timeout"
+                    }));
+            try
+            {
+                TT_Fstat(param.fd, key);
+            }
+            catch
+            {
+                RemovePendingCallback(s_fstatParams, key);
+                throw;
+            }
         }
 
         public override TTStatInfo FstatSync(FstatSyncParam param)

@@ -171,7 +171,6 @@ namespace TTSDK
         /// 读取文件描述信息（同步）
         /// </summary>
         /// <param name="path">文件/目录路径</param>
-        /// <param name="recursive">是否递归获取目录下的每个文件的 Stat 信息	</param>
         /// <param name="throwException">是否抛出错误信息，如果抛出错误信息，当文件不存在时则会抛出异常，错误信息从异常中获取。</param>
         /// <returns>返回文件信息，如果访问失败则返回null</returns>
         [TTVersion(MinTTContainerAndroidVersion = "1.0", IsSupportWebGL = true)]
@@ -272,28 +271,28 @@ namespace TTSDK
         /// <summary>
         /// 打开一个文件
         /// </summary>
-        /// <param name="filePath"></param>
+        /// <param name="param">打开文件参数。</param>
         /// <returns></returns>
         public abstract void Open(OpenParam param);
 
         /// <summary>
         /// 同步打开一个文件
         /// </summary>
-        /// <param name="filePath"></param>
+        /// <param name="param">同步打开文件参数。</param>
         /// <returns></returns>
         public abstract string OpenSync(OpenSyncParam param);
 
         /// <summary>
         /// 关闭一个文件
         /// </summary>
-        /// <param name="fd"></param>
+        /// <param name="param">关闭文件参数。</param>
         /// <returns></returns>
         public abstract void Close(CloseParam param);
 
         /// <summary>
         /// 同步关闭一个文件
         /// </summary>
-        /// <param name="fd"></param>
+        /// <param name="param">同步关闭文件参数。</param>
         /// <returns></returns>
         public abstract void CloseSync(CloseSyncParam param);
         /// <summary>

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using TTSDK;
 using TTSDK.UNBridgeLib.LitJson;
 using UnityEngine;
@@ -31,7 +32,7 @@ namespace TikTokMiniGameDemo
         public ScrollRect LogScroll;
         /// <summary>Clears the log buffer. / 清空日志缓冲。</summary>
         public Button ClearLogButton;
-        /// <summary>The big "Init SDK" button at the top — must be pressed first. / 顶部的"Init SDK"按钮，必须首先按一次。</summary>
+        /// <summary>The big "Init SDK" button at the top — must be pressed first. / 顶部的 "Init SDK" 按钮，必须首先按一次。</summary>
         public Button InitSdkButton;
         /// <summary>Tiny status text under the title showing inited / not inited. / 标题下方显示 SDK 已初始化 / 未初始化的小字。</summary>
         public Text StatusText;
@@ -51,7 +52,14 @@ namespace TikTokMiniGameDemo
 
         private readonly List<string> _logBuffer = new List<string>();
         private const int MaxLogLines = 200;
+        private const int FeatureListBottomClearance = 120;
+        private const float ExpandedActionBottomPadding = 140f;
+        private const int CanIUseNamesPerLogLine = 8;
+
         private bool _sdkInited;
+        private bool _lifecycleRegistered;
+        private bool _beforeExitSet;
+        private bool _keyboardListenersRegistered;
 
         // EN: Listener handles so we can Off them later. Without these, the Off* APIs cannot
         //     find the matching callback to remove (TT registers by delegate equality).
@@ -59,6 +67,9 @@ namespace TikTokMiniGameDemo
         private OnNetworkStatusChangeCallback _networkStatusCb;
         private OnNetworkWeakChangeCallback _networkWeakCb;
         private OnFeedStatusChangeCallback _feedStatusCb;
+        private TTKeyboard.OnKeyboardInputEvent _keyboardInputCb;
+        private TTKeyboard.OnKeyboardConfirmEvent _keyboardConfirmCb;
+        private TTKeyboard.OnKeyboardCompleteEvent _keyboardCompleteCb;
 
         // =================================================================
         // Lifecycle / 生命周期
@@ -68,11 +79,11 @@ namespace TikTokMiniGameDemo
         {
             // EN: Title shows the SDK *package* version (the unitypackage you imported),
             //     baked in by DemoSceneBuilder. We prefer it over TT.TTSDKVersion because
-            //     TT.TTSDKVersion tracks the internal SDK source revision (e.g. 6.3.9),
-            //     while CPs usually think in terms of the released package (e.g. 1.1.1).
+            //     TT.TTSDKVersion tracks the internal SDK source revision, while CPs usually
+            //     think in terms of the released package (e.g. 1.1.7-Beta).
             // ZH: 标题显示 SDK *包*版本（你导入的 unitypackage），由 DemoSceneBuilder 烘焙。
-            //     用它而不是 TT.TTSDKVersion，因为后者跟踪 SDK 内部源码版本（如 6.3.9），
-            //     而 CP 一般习惯按发版包号（如 1.1.1）来识别。
+            //     用它而不是 TT.TTSDKVersion，因为后者跟踪 SDK 内部源码版本，
+            //     而 CP 一般习惯按发版包号（如 1.1.7-Beta）来识别。
             TitleText.text = $"TikTok Mini Game SDK Demo  ·  v{PackageVersion}";
             UpdateStatus();
 
@@ -80,8 +91,53 @@ namespace TikTokMiniGameDemo
             InitSdkButton.onClick.AddListener(InitSdk);
 
             BuildFeatureButtons();
+            EnsureFeatureListBottomClearance();
             Log($"Platform: {Application.platform}");
             Log("Press [Init SDK] to start. Tap a category to expand its TT.* API buttons.");
+        }
+
+        private void OnDestroy()
+        {
+            if (_keyboardListenersRegistered)
+            {
+                TT.OnKeyboardInput -= _keyboardInputCb;
+                TT.OnKeyboardConfirm -= _keyboardConfirmCb;
+                TT.OnKeyboardComplete -= _keyboardCompleteCb;
+                _keyboardListenersRegistered = false;
+            }
+            if (_networkStatusCb != null)
+            {
+                try { TT.OffNetworkStatusChange(_networkStatusCb); } catch { }
+                _networkStatusCb = null;
+            }
+            if (_networkWeakCb != null)
+            {
+                try { TT.OffNetworkWeakChange(_networkWeakCb); } catch { }
+                _networkWeakCb = null;
+            }
+            if (_feedStatusCb != null)
+            {
+                try { TT.OffFeedStatusChange(_feedStatusCb); } catch { }
+                _feedStatusCb = null;
+            }
+        }
+
+        /// <summary>
+        /// Keep the final category and its expanded actions above the adjacent log panel.
+        /// 让最后一个分类及其展开的子按钮始终能滚到日志面板上方，不被边界遮挡。
+        /// </summary>
+        private void EnsureFeatureListBottomClearance()
+        {
+            var layout = ButtonContainer != null
+                ? ButtonContainer.GetComponent<VerticalLayoutGroup>()
+                : null;
+            if (layout == null || layout.padding.bottom >= FeatureListBottomClearance)
+                return;
+
+            var padding = layout.padding;
+            padding.bottom = FeatureListBottomClearance;
+            layout.padding = padding;
+            Canvas.ForceUpdateCanvases();
         }
 
         // =================================================================
@@ -101,12 +157,15 @@ namespace TikTokMiniGameDemo
                 ("Clean File Cache", DoCleanFileCache));
 
             AddCategory("生命周期 / Lifecycle",
+                ("Get App Lifecycle", DoGetAppLifecycle),
                 ("Register App Show/Hide", DoRegisterAppLifecycle),
                 ("Set Before-Exit Listener", DoSetBeforeExit));
 
             AddCategory("账号 / Auth",
                 ("Login", DoLogin),
-                ("Authorize userInfo", DoAuthorize));
+                ("Authorize (user.info.basic)", DoAuthorize),
+                ("Request Subscribe Message (default)", () => DoRequestSubscribeMessage(false)),
+                ("Request Subscribe Message (manual)", () => DoRequestSubscribeMessage(true)));
 
             AddCategory("分享 / Share",
                 ("Share App Message", DoShare));
@@ -119,11 +178,17 @@ namespace TikTokMiniGameDemo
 
             AddCategory("任务奖励 / Mission",
                 ("Start Entrance Mission", DoStartEntranceMission),
-                ("Get Entrance Mission Reward", DoGetEntranceMissionReward));
+                ("Get Entrance Mission Reward", DoGetEntranceMissionReward),
+                ("Get Revisit Mission Reward", DoGetRevisitMissionReward),
+                ("Report Mission Reward Granted", DoReportMissionRewardGranted));
 
             AddCategory("广告 / Ads",
-                ("Rewarded Video Ad", DoRewardedAd),
-                ("Interstitial Ad", DoInterstitialAd));
+                ("Rewarded Ad: Create & Load", DoRewardedAdLoad),
+                ("Rewarded Ad: Show", DoRewardedAdShow),
+                ("Rewarded Ad: Destroy", DoRewardedAdDestroy),
+                ("Interstitial Ad: Create & Load", DoInterstitialAdLoad),
+                ("Interstitial Ad: Show", DoInterstitialAdShow),
+                ("Interstitial Ad: Destroy", DoInterstitialAdDestroy));
 
             AddCategory("网络 / Network",
                 ("Get Network Type", DoGetNetworkType),
@@ -143,7 +208,8 @@ namespace TikTokMiniGameDemo
                 ("Hide Keyboard", DoHideKeyboard));
 
             AddCategory("桌面快捷 / Shortcut",
-                ("Add Shortcut", DoAddShortcut));
+                ("Add Shortcut", DoAddShortcut),
+                ("Get Shortcut Mission Reward", DoGetShortcutMissionReward));
 
             AddCategory("存档 / Storage",
                 ("PlayerPrefs ++counter", DoPlayerPrefs),
@@ -153,13 +219,28 @@ namespace TikTokMiniGameDemo
                 ("Clear All Savings", DoClearAllSavings),
                 ("Saving Disk Size", DoSavingDiskSize));
 
-            AddCategory("Feed 直玩",
+            AddCategory("文件系统 / FileSystem",
+                ("FS Roundtrip (write→access→read→unlink)", DoFileSystemRoundtrip));
+
+            AddCategory("Feed 直玩 / Feed",
                 ("On Feed Status Change", DoOnFeedStatusChange),
-                ("Off Feed Status Change", DoOffFeedStatusChange));
+                ("Off Feed Status Change", DoOffFeedStatusChange),
+                ("Get Feed Manager", DoGetFeedManager),
+                ("Store Feed Data", DoStoreFeedData),
+                ("Get Feed Data", DoGetFeedData),
+                ("Check Feed Subscribe Status", DoCheckFeedSubscribeStatus),
+                ("Request Feed Subscribe", DoRequestFeedSubscribe));
 
             AddCategory("上报 / Analytics",
                 ("Report Event", DoReportEvent),
                 ("Report Scene", DoReportScene));
+
+            AddCategory("能力检测 / CanIUse",
+                ("Dump all CanIUse flags", DoDumpCanIUse));
+
+#if UNITY_EDITOR
+            BuildMockCategory();
+#endif
         }
 
         /// <summary>
@@ -168,16 +249,26 @@ namespace TikTokMiniGameDemo
         /// </summary>
         private void AddCategory(string title, params (string label, Action handler)[] items)
         {
-            var subButtons = new List<GameObject>();
+            var group = MakeHeader(title);
+            foreach (var item in items) AddSubButton(group, item.label, item.handler);
+        }
+
+        /// <summary>
+        /// Spawn a collapsible category header. Returns the (initially empty) list of child
+        /// GameObjects the header toggles.
+        /// 生成一个可折叠的分类头，返回它所控制的子节点列表（初始为空）。
+        /// </summary>
+        private List<GameObject> MakeHeader(string title)
+        {
+            var group = new List<GameObject>();
             bool expanded = false;
-            string baseLabel = title;
 
             // EN: Header button uses a distinct slate color to contrast with the blue sub-buttons.
             // ZH: 分类头使用 slate 灰色，与蓝色子按钮形成对比。
             var headerBtn = SpawnButton();
             headerBtn.name = $"Header_{title}";
             var headerText = headerBtn.GetComponentInChildren<Text>();
-            headerText.text = $"▶  {baseLabel}";
+            headerText.text = $"▶  {title}";
             headerText.fontStyle = FontStyle.Bold;
             var hcolors = headerBtn.colors;
             hcolors.normalColor = new Color(0.28f, 0.32f, 0.40f);
@@ -188,27 +279,60 @@ namespace TikTokMiniGameDemo
             headerBtn.onClick.AddListener(() =>
             {
                 expanded = !expanded;
-                headerText.text = (expanded ? "▼  " : "▶  ") + baseLabel;
-                foreach (var go in subButtons) go.SetActive(expanded);
+                headerText.text = (expanded ? "▼  " : "▶  ") + title;
+                foreach (var go in group) go.SetActive(expanded);
                 // EN: ContentSizeFitter + VerticalLayoutGroup recompute their layout on the next
                 //     frame. ForceUpdateCanvases makes the scroll content height update now so
                 //     scrollbar position stays sane.
                 // ZH: ContentSizeFitter + VerticalLayoutGroup 默认下一帧才重算；
                 //     ForceUpdateCanvases 立刻刷新，让滚动条位置不抖。
                 Canvas.ForceUpdateCanvases();
+                if (expanded) EnsureLastExpandedActionVisible(group);
             });
+            return group;
+        }
 
-            foreach (var item in items)
-            {
-                var btn = SpawnButton();
-                btn.name = $"Btn_{item.label}";
-                btn.GetComponentInChildren<Text>().text = $"   {item.label}"; // EN: indent for visual hierarchy / ZH: 缩进表达层级
-                var label = item.label;
-                var handler = item.handler;
-                btn.onClick.AddListener(() => SafeInvoke(label, handler));
-                btn.gameObject.SetActive(false); // EN: start collapsed / ZH: 默认折叠
-                subButtons.Add(btn.gameObject);
-            }
+        private void AddSubButton(List<GameObject> group, string label, Action handler)
+        {
+            var btn = SpawnButton();
+            btn.name = $"Btn_{label}";
+            btn.GetComponentInChildren<Text>().text = $"   {label}"; // EN: indent for visual hierarchy / ZH: 缩进表达层级
+            btn.onClick.AddListener(() => SafeInvoke(label, handler));
+            btn.gameObject.SetActive(false); // EN: start collapsed / ZH: 默认折叠
+            group.Add(btn.gameObject);
+        }
+
+        /// <summary>
+        /// Keep the last action of a newly expanded category inside the FeatureScroll viewport.
+        /// 展开分类时，若最后一个子按钮落到视口底边以下，则自动滚入可见区域。
+        /// </summary>
+        private void EnsureLastExpandedActionVisible(List<GameObject> group)
+        {
+            if (ButtonContainer == null || group == null || group.Count == 0)
+                return;
+
+            var scrollRect = ButtonContainer.GetComponentInParent<ScrollRect>();
+            var viewport = scrollRect != null ? scrollRect.viewport : null;
+            var target = group[group.Count - 1] != null
+                ? group[group.Count - 1].GetComponent<RectTransform>()
+                : null;
+            if (scrollRect == null || viewport == null || target == null)
+                return;
+
+            Canvas.ForceUpdateCanvases();
+            var targetBounds = RectTransformUtility.CalculateRelativeRectTransformBounds(viewport, target);
+            var safeBottom = viewport.rect.yMin + ExpandedActionBottomPadding;
+            if (targetBounds.min.y >= safeBottom)
+                return;
+
+            var content = scrollRect.content != null ? scrollRect.content : ButtonContainer;
+            var maxOffset = Mathf.Max(0f, content.rect.height - viewport.rect.height);
+            var position = content.anchoredPosition;
+            position.y = Mathf.Clamp(position.y + safeBottom - targetBounds.min.y, 0f, maxOffset);
+            scrollRect.StopMovement();
+            scrollRect.velocity = Vector2.zero;
+            content.anchoredPosition = position;
+            Canvas.ForceUpdateCanvases();
         }
 
         /// <summary>
@@ -265,12 +389,22 @@ namespace TikTokMiniGameDemo
                 return;
             }
             Log("▶ Init SDK");
+
+#if UNITY_EDITOR
+            // EN: Enable Pay mock by default in Editor so payment APIs show interactive popups.
+            // ZH: Editor 下默认打开 Pay mock，便于直接体验支付交互弹窗。
+            try { MockSetting.SwithMockModule(MockModule.Pay, true); } catch { }
+            RefreshMockLabels();
+#endif
+
             try
             {
                 TT.InitSDK((code, env) =>
                 {
-                    // EN: code == 0 → success; non-zero values are SDK-specific errors.
-                    // ZH: code == 0 表示成功，其他值参考 SDK 文档错误码。
+                    // EN: code == 0 → success; non-zero values are SDK-specific errors
+                    //     (1: unsupported SDK, 2: unsupported Unity, -1: internal error, -2: timeout).
+                    // ZH: code == 0 表示成功，其他值参考 SDK 文档错误码
+                    //     （1: SDK 版本不支持, 2: Unity 版本不支持, -1: 内部错误, -2: 回调超时）。
                     _sdkInited = (code == 0);
                     Log($"  ← InitSDK code={code} containerEnv={(env != null ? "ok" : "null")}");
                     UpdateStatus();
@@ -353,7 +487,16 @@ namespace TikTokMiniGameDemo
 
         #region Lifecycle
 
-        private bool _lifecycleRegistered;
+        /// <summary>
+        /// <c>TT.GetAppLifeCycle</c> — fetch the singleton lifecycle manager.
+        /// <c>TT.GetAppLifeCycle</c>——获取应用生命周期管理器。
+        /// </summary>
+        private void DoGetAppLifecycle()
+        {
+            var lc = TT.GetAppLifeCycle();
+            Log($"  ← GetAppLifeCycle: {(lc != null ? "ok" : "null")}");
+        }
+
         /// <summary>
         /// Subscribe to <c>TT.GetAppLifeCycle().OnShow / OnHide</c> for foreground/background events.
         /// 订阅 <c>TT.GetAppLifeCycle().OnShow / OnHide</c>，监听前/后台切换。
@@ -369,19 +512,22 @@ namespace TikTokMiniGameDemo
             Log("  ← Registered OnShow / OnHide");
         }
 
-        private bool _beforeExitSet;
         /// <summary>
-        /// Intercept the user's exit gesture. Return <c>true</c> to suppress default exit
-        /// (you must call your own exit logic), <c>false</c> to let the container exit.
-        /// 拦截用户的退出操作。返回 <c>true</c> 表示自行处理退出（需自行调用退出逻辑），
-        /// 返回 <c>false</c> 表示走容器默认退出。
+        /// Intercept the user's exit gesture via <c>TT.SetOnBeforeExitAppListener</c>.
+        /// Return <c>true</c> to suppress default exit (you handle exit yourself),
+        /// <c>false</c> to let the container exit normally.
+        /// 通过 <c>TT.SetOnBeforeExitAppListener</c> 拦截用户退出操作。返回 <c>true</c> 表示
+        /// 自行处理退出，返回 <c>false</c> 走容器默认退出。
         /// </summary>
         private void DoSetBeforeExit()
         {
             if (_beforeExitSet) { Log("  before-exit already set"); return; }
-            var lc = TT.GetAppLifeCycle();
-            if (lc == null) { Log("  ← GetAppLifeCycle returned null"); return; }
-            lc.SetOnBeforeExitAppListener(() =>
+            if (!CanIUse.SetOnBeforeExitAppListener)
+            {
+                Log("  ← SetOnBeforeExitAppListener not supported on current host; skipped");
+                return;
+            }
+            TT.SetOnBeforeExitAppListener(() =>
             {
                 Log("  ← BeforeExitApp invoked (returning false → default exit)");
                 return false;
@@ -396,8 +542,8 @@ namespace TikTokMiniGameDemo
 
         /// <summary>
         /// <c>TT.Login</c> — exchange container session for a short-lived <c>code</c> your
-        /// backend uses to fetch the openid via Douyin's openapi.
-        /// <c>TT.Login</c>——把容器会话换成临时 <c>code</c>，由后端拿去抖音开放接口换 openid。
+        /// backend uses to fetch the openid via the TikTok / Douyin open API.
+        /// <c>TT.Login</c>——把容器会话换成临时 <c>code</c>，由后端拿去开放接口换 openid。
         /// </summary>
         private void DoLogin()
         {
@@ -407,14 +553,33 @@ namespace TikTokMiniGameDemo
         }
 
         /// <summary>
-        /// <c>TT.Authorize</c> — request a scope. "scope.userInfo" is the most common one.
-        /// <c>TT.Authorize</c>——请求授权 scope。最常用的是 "scope.userInfo"。
+        /// <c>TT.Authorize</c> — request a scope (e.g. <c>"user.info.basic"</c>).
+        /// <c>TT.Authorize</c>——请求授权 scope（如 <c>"user.info.basic"</c>）。
         /// </summary>
         private void DoAuthorize()
         {
-            TT.Authorize("scope.userInfo",
+            TT.Authorize("user.info.basic",
                 ok => Log($"  ← Authorize ok: {ok}"),
                 (e, m) => Log($"  ← Authorize fail: {e} / {m}"));
+        }
+
+        /// <summary>
+        /// <c>TT.RequestSubscribeMessage</c> — prompt the player to confirm message subscription.
+        /// Set <c>isManualSubscribe = true</c> when triggered explicitly by a user button tap.
+        /// <c>TT.RequestSubscribeMessage</c>——请求用户确认订阅消息。
+        /// 由用户主动点击按钮触发时可设置 <c>isManualSubscribe = true</c>。
+        /// </summary>
+        private void DoRequestSubscribeMessage(bool isManualSubscribe)
+        {
+            Log($"  mode={(isManualSubscribe ? "manual" : "default")}, isManualSubscribe={isManualSubscribe}");
+            var param = new TTRequestSubscribeMessageParam
+            {
+                isManualSubscribe = isManualSubscribe,
+                success = r => Log($"  ← RequestSubscribeMessage success: isSubscribeConfirmed={r?.isSubscribeConfirmed ?? "null"}"),
+                fail = err => Log($"  ← RequestSubscribeMessage fail: code={err?.ErrorCode}, msg={err?.ErrMsg}"),
+                complete = _ => Log("  ← RequestSubscribeMessage complete"),
+            };
+            TT.RequestSubscribeMessage(param);
         }
 
         #endregion
@@ -455,10 +620,10 @@ namespace TikTokMiniGameDemo
         {
             TT.Pay(new TTPayParam
             {
-                trade_order_id = "demo_order_001",
+                trade_order_id = "demo_order_" + DateTime.Now.Ticks,
                 success = r => Log($"  ← Pay success: {r?.errMsg}"),
                 fail = err => Log($"  ← Pay fail: {err?.ErrMsg}"),
-                complete = r => Log("  ← Pay complete"),
+                complete = _ => Log("  ← Pay complete"),
             });
         }
 
@@ -470,11 +635,11 @@ namespace TikTokMiniGameDemo
         {
             TT.CheckBalance(new TTCheckBalanceParam
             {
-                amount = 1.0f,
-                type = "diamond",
+                amount = 50f,
+                type = "BEANS",
                 success = r => Log($"  ← CheckBalance is_sufficient={r?.is_sufficient}"),
                 fail = err => Log($"  ← CheckBalance fail: {err?.ErrMsg}"),
-                complete = r => Log("  ← CheckBalance complete"),
+                complete = _ => Log("  ← CheckBalance complete"),
             });
         }
 
@@ -486,10 +651,10 @@ namespace TikTokMiniGameDemo
         {
             TT.Recharge(new TTRechargeParam
             {
-                tier_id = "demo_tier",
+                tier_id = "tier_100",
                 success = r => Log($"  ← Recharge success: {r?.errMsg}"),
                 fail = err => Log($"  ← Recharge fail: {err?.ErrMsg}"),
-                complete = r => Log("  ← Recharge complete"),
+                complete = _ => Log("  ← Recharge complete"),
             });
         }
 
@@ -501,10 +666,10 @@ namespace TikTokMiniGameDemo
         {
             TT.NavigateToBalance(new TTNavigateToBalanceParam
             {
-                type = "diamond",
+                type = "BEANS",
                 success = r => Log($"  ← NavigateToBalance success: {r?.errMsg}"),
                 fail = err => Log($"  ← NavigateToBalance fail: {err?.ErrMsg}"),
-                complete = r => Log("  ← NavigateToBalance complete"),
+                complete = _ => Log("  ← NavigateToBalance complete"),
             });
         }
 
@@ -523,12 +688,12 @@ namespace TikTokMiniGameDemo
             {
                 success = r => Log($"  ← StartEntranceMission is_sufficient={r?.is_sufficient}"),
                 fail = err => Log($"  ← StartEntranceMission fail: {err?.ErrMsg}"),
-                complete = r => Log("  ← StartEntranceMission complete"),
+                complete = _ => Log("  ← StartEntranceMission complete"),
             });
         }
 
         /// <summary>
-        /// <c>TT.GetEntranceMissionReward</c> — check / claim the reward for the active mission.
+        /// <c>TT.GetEntranceMissionReward</c> — check / claim the reward for the entrance mission.
         /// <c>TT.GetEntranceMissionReward</c>——查询或领取入口任务奖励。
         /// </summary>
         private void DoGetEntranceMissionReward()
@@ -537,7 +702,41 @@ namespace TikTokMiniGameDemo
             {
                 success = r => Log($"  ← GetEntranceMissionReward canReceiveReward={r?.canReceiveReward}"),
                 fail = err => Log($"  ← GetEntranceMissionReward fail: {err?.ErrMsg}"),
-                complete = r => Log("  ← GetEntranceMissionReward complete"),
+                complete = _ => Log("  ← GetEntranceMissionReward complete"),
+            });
+        }
+
+        /// <summary>
+        /// <c>TT.GetRevisitMissionReward</c> (host ≥ 46.0.0) — query revisit mission eligibility
+        /// and reward scene (<c>REVISIT_EDUCATION</c> / <c>ADD_TO_DESKTOP</c>).
+        /// Only grant the in-game reward when <c>canReceiveReward == true</c>.
+        /// <c>TT.GetRevisitMissionReward</c>（宿主 ≥ 46.0.0）——查询复访任务奖励资格与场景。
+        /// 仅在 <c>canReceiveReward == true</c> 时发放业务奖励。
+        /// </summary>
+        private void DoGetRevisitMissionReward()
+        {
+            TT.GetRevisitMissionReward(new TTGetRevisitMissionRewardParam
+            {
+                success = r => Log($"  ← GetRevisitMissionReward canReceiveReward={r?.canReceiveReward}, rewardScene={r?.rewardScene}, scene={r?.scene}"),
+                fail = err => Log($"  ← GetRevisitMissionReward fail: {err?.ErrMsg}"),
+                complete = _ => Log("  ← GetRevisitMissionReward complete"),
+            });
+        }
+
+        /// <summary>
+        /// <c>TT.ReportMissionRewardGranted</c> (host ≥ 46.0.0) — notify TikTok after your
+        /// backend/game confirms the revisit reward has been granted, so the host displays
+        /// a reward-received toast. Does not grant the reward itself.
+        /// <c>TT.ReportMissionRewardGranted</c>（宿主 ≥ 46.0.0）——业务发奖确认后通知 TikTok
+        /// 展示到账反馈；该接口本身不负责发奖。
+        /// </summary>
+        private void DoReportMissionRewardGranted()
+        {
+            TT.ReportMissionRewardGranted(new TTReportMissionRewardGrantedParam
+            {
+                success = r => Log($"  ← ReportMissionRewardGranted success: {r?.errMsg}"),
+                fail = err => Log($"  ← ReportMissionRewardGranted fail: {err?.ErrMsg}"),
+                complete = _ => Log("  ← ReportMissionRewardGranted complete"),
             });
         }
 
@@ -546,39 +745,108 @@ namespace TikTokMiniGameDemo
         #region Ads
 
         private TTRewardedVideoAd _rewardedAd;
-        /// <summary>
-        /// <c>TT.CreateRewardedVideoAd</c> — rewarded video. <b>No</b> <c>Load()</c>: the
-        /// returned object exposes only <c>Show()</c> / <c>Destroy()</c>; the SDK preloads
-        /// the creative internally. <c>OnClose(isEnded)</c> tells you if the user watched
-        /// to completion (so you should grant the reward).
-        /// <c>TT.CreateRewardedVideoAd</c>——激励视频。<b>没有</b> <c>Load()</c>，返回对象只暴露
-        /// <c>Show()</c> / <c>Destroy()</c>，预加载由 SDK 内部处理。<c>OnClose(isEnded)</c>
-        /// 告诉你用户是否看完（看完才发奖）。
-        /// </summary>
-        private void DoRewardedAd()
+
+        private TTRewardedVideoAd EnsureRewardedAd()
         {
+            if (_rewardedAd != null) return _rewardedAd;
+
             _rewardedAd = TT.CreateRewardedVideoAd(new CreateRewardedVideoAdParam { AdUnitId = "demo_ad_unit" });
-            if (_rewardedAd == null) { Log("  ← CreateRewardedVideoAd returned null"); return; }
+            if (_rewardedAd == null)
+            {
+                Log("  ← CreateRewardedVideoAd returned null");
+                return null;
+            }
+            _rewardedAd.OnLoad += () => Log($"  ← Rewarded ad loaded (IsLoaded={_rewardedAd?.IsLoaded()})");
             _rewardedAd.OnError += (code, msg) => Log($"  ← Rewarded ad error {code}: {msg}");
             _rewardedAd.OnClose += isEnded => Log($"  ← Rewarded ad closed, ended={isEnded}");
-            Log("  ← Created rewarded ad, calling Show()");
-            try { _rewardedAd.Show(); } catch (Exception e) { Log($"  Show threw: {e.Message}"); }
+            Log("  ← Created rewarded ad instance");
+            return _rewardedAd;
+        }
+
+        /// <summary>
+        /// <c>TT.CreateRewardedVideoAd</c> + <c>Load()</c> (preload, host ≥ 46.1.0).
+        /// Preload creatives ahead of time and listen to <c>OnLoad</c> / check <c>IsLoaded()</c>.
+        /// <c>TT.CreateRewardedVideoAd</c> + <c>Load()</c>（预加载，宿主 ≥ 46.1.0）。
+        /// 提前拉取广告素材，并通过 <c>OnLoad</c> / <c>IsLoaded()</c> 感知就绪状态。
+        /// </summary>
+        private void DoRewardedAdLoad()
+        {
+            var ad = EnsureRewardedAd();
+            if (ad == null) return;
+            Log($"  calling Load() (IsLoaded before={ad.IsLoaded()})");
+            ad.Load();
+        }
+
+        /// <summary>
+        /// <c>TTRewardedVideoAd.Show()</c> — present the rewarded video ad (creates on demand).
+        /// <c>OnClose(isEnded)</c> tells you whether the player finished watching.
+        /// <c>TTRewardedVideoAd.Show()</c>——展示激励视频广告（未创建时自动创建）。
+        /// <c>OnClose(isEnded)</c> 告知是否完整观看。
+        /// </summary>
+        private void DoRewardedAdShow()
+        {
+            var ad = EnsureRewardedAd();
+            if (ad == null) return;
+            Log($"  calling Show() (IsLoaded={ad.IsLoaded()})");
+            ad.Show();
+        }
+
+        /// <summary><c>TTRewardedVideoAd.Destroy()</c> — release the current ad instance. / 释放当前激励视频广告实例。</summary>
+        private void DoRewardedAdDestroy()
+        {
+            if (_rewardedAd == null) { Log("  no rewarded ad instance to destroy"); return; }
+            _rewardedAd.Destroy();
+            _rewardedAd = null;
+            Log("  ← Destroyed rewarded ad");
         }
 
         private TTInterstitialAd _interstitialAd;
-        /// <summary>
-        /// <c>TT.CreateInterstitialAd</c> — interstitial. Same shape as rewarded but with no
-        /// reward callback.
-        /// <c>TT.CreateInterstitialAd</c>——插屏广告。接口形态与激励视频相同，无奖励回调。
-        /// </summary>
-        private void DoInterstitialAd()
+
+        private TTInterstitialAd EnsureInterstitialAd()
         {
+            if (_interstitialAd != null) return _interstitialAd;
+
             _interstitialAd = TT.CreateInterstitialAd(new CreateInterstitialAdParam { InterstitialAdId = "demo_interstitial" });
-            if (_interstitialAd == null) { Log("  ← CreateInterstitialAd returned null"); return; }
+            if (_interstitialAd == null)
+            {
+                Log("  ← CreateInterstitialAd returned null");
+                return null;
+            }
+            _interstitialAd.OnLoad += () => Log($"  ← Interstitial loaded (IsLoaded={_interstitialAd?.IsLoaded()})");
             _interstitialAd.OnError += (code, msg) => Log($"  ← Interstitial error {code}: {msg}");
             _interstitialAd.OnClose += () => Log("  ← Interstitial closed");
-            Log("  ← Created interstitial ad, calling Show()");
-            try { _interstitialAd.Show(); } catch (Exception e) { Log($"  Show threw: {e.Message}"); }
+            Log("  ← Created interstitial ad instance");
+            return _interstitialAd;
+        }
+
+        /// <summary>
+        /// <c>TT.CreateInterstitialAd</c> + <c>Load()</c> (preload, host ≥ 46.1.0).
+        /// <c>TT.CreateInterstitialAd</c> + <c>Load()</c>（插屏广告预加载，宿主 ≥ 46.1.0）。
+        /// </summary>
+        private void DoInterstitialAdLoad()
+        {
+            var ad = EnsureInterstitialAd();
+            if (ad == null) return;
+            Log($"  calling Load() (IsLoaded before={ad.IsLoaded()})");
+            ad.Load();
+        }
+
+        /// <summary><c>TTInterstitialAd.Show()</c> — present the interstitial ad. / 展示插屏广告。</summary>
+        private void DoInterstitialAdShow()
+        {
+            var ad = EnsureInterstitialAd();
+            if (ad == null) return;
+            Log($"  calling Show() (IsLoaded={ad.IsLoaded()})");
+            ad.Show();
+        }
+
+        /// <summary><c>TTInterstitialAd.Destroy()</c> — release the current interstitial instance. / 释放当前插屏广告实例。</summary>
+        private void DoInterstitialAdDestroy()
+        {
+            if (_interstitialAd == null) { Log("  no interstitial ad instance to destroy"); return; }
+            _interstitialAd.Destroy();
+            _interstitialAd = null;
+            Log("  ← Destroyed interstitial ad");
         }
 
         #endregion
@@ -644,7 +912,7 @@ namespace TikTokMiniGameDemo
 
         #region Device
 
-        /// <summary><c>TT.VibrateShort</c> — ~15ms haptic. / <c>TT.VibrateShort</c>——约 15ms 触感。</summary>
+        /// <summary><c>TT.VibrateShort</c> — ~15ms (iOS) / ~30ms (Android) haptic. / 短震动。</summary>
         private void DoVibrateShort()
         {
             TT.VibrateShort(new VibrateShortParam
@@ -655,7 +923,7 @@ namespace TikTokMiniGameDemo
             });
         }
 
-        /// <summary><c>TT.VibrateLong</c> — ~400ms haptic. / <c>TT.VibrateLong</c>——约 400ms 触感。</summary>
+        /// <summary><c>TT.VibrateLong</c> — ~400ms haptic. / 约 400ms 长震动。</summary>
         private void DoVibrateLong()
         {
             TT.VibrateLong(new VibrateLongParam
@@ -681,13 +949,23 @@ namespace TikTokMiniGameDemo
         #region Keyboard
 
         /// <summary>
-        /// <c>TT.ShowKeyboard</c> — bring up the soft keyboard (WebGL only). Hook the
-        /// per-key / confirm / dismiss callbacks on <c>TT.GetTTKeyboard()</c> if you need them.
-        /// <c>TT.ShowKeyboard</c>——拉起软键盘（仅 WebGL）。
-        /// 输入 / 确认 / 收起回调挂在 <c>TT.GetTTKeyboard()</c> 上。
+        /// <c>TT.ShowKeyboard</c> — bring up the soft keyboard (WebGL only) and subscribe once
+        /// to <c>TT.OnKeyboardInput</c>, <c>TT.OnKeyboardConfirm</c>, and <c>TT.OnKeyboardComplete</c>.
+        /// <c>TT.ShowKeyboard</c>——拉起软键盘（仅 WebGL），并订阅输入 / 确认 / 收起事件。
         /// </summary>
         private void DoShowKeyboard()
         {
+            if (!_keyboardListenersRegistered)
+            {
+                _keyboardInputCb = value => Log($"  ← Keyboard input: {value}");
+                _keyboardConfirmCb = value => Log($"  ← Keyboard confirm: {value}");
+                _keyboardCompleteCb = value => Log($"  ← Keyboard complete: {value}");
+                TT.OnKeyboardInput += _keyboardInputCb;
+                TT.OnKeyboardConfirm += _keyboardConfirmCb;
+                TT.OnKeyboardComplete += _keyboardCompleteCb;
+                _keyboardListenersRegistered = true;
+            }
+
             TT.ShowKeyboard(
                 new TTKeyboard.ShowKeyboardOptions
                 {
@@ -720,6 +998,21 @@ namespace TikTokMiniGameDemo
         private void DoAddShortcut()
         {
             TT.AddShortcut(ok => Log($"  ← AddShortcut: {ok}"));
+        }
+
+        /// <summary>
+        /// <c>TT.GetShortcutMissionReward</c> — query whether the player is eligible for the
+        /// add-to-home-screen shortcut mission reward.
+        /// <c>TT.GetShortcutMissionReward</c>——查询桌面快捷方式任务奖励资格。
+        /// </summary>
+        private void DoGetShortcutMissionReward()
+        {
+            TT.GetShortcutMissionReward(new GetShortcutMissionRewardParam
+            {
+                Success = r => Log($"  ← GetShortcutMissionReward canReceiveReward={r?.CanReceiveReward}"),
+                Fail = err => Log($"  ← GetShortcutMissionReward fail: {err?.ErrMsg}"),
+                Complete = () => Log("  ← GetShortcutMissionReward complete"),
+            });
         }
 
         #endregion
@@ -803,6 +1096,41 @@ namespace TikTokMiniGameDemo
 
         #endregion
 
+        #region FileSystem
+
+        /// <summary>
+        /// <c>TT.GetFileSystemManager</c> — synchronous file API roundtrip under
+        /// <c>TTFileSystemManager.USER_DATA_PATH</c>: write → access → read → unlink.
+        /// <c>TT.GetFileSystemManager</c>——在 <c>USER_DATA_PATH</c> 下完成同步文件读写闭环：
+        /// 写入 → 判断存在 → 读回 → 删除。
+        /// </summary>
+        private void DoFileSystemRoundtrip()
+        {
+            var fs = TT.GetFileSystemManager();
+            if (fs == null) { Log("  ← GetFileSystemManager returned null"); return; }
+
+            string root = TTFileSystemManager.USER_DATA_PATH;
+            string path = root + "/demo_fs_test.txt";
+            string content = "hello fs @ " + DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            if (!fs.AccessSync(root))
+            {
+                string mk = fs.MkdirSync(root, true);
+                if (!string.IsNullOrEmpty(mk)) Log($"  MkdirSync({root}) → {mk}");
+            }
+
+            string wr = fs.WriteFileSync(path, content, "utf8");
+            Log($"  ← WriteFileSync → {(string.IsNullOrEmpty(wr) ? "ok" : wr)}");
+            Log($"  ← AccessSync exists={fs.AccessSync(path)}");
+            string read = fs.ReadFileSync(path, "utf8");
+            Log($"  ← ReadFileSync → {read}");
+            string un = fs.UnlinkSync(path);
+            Log($"  ← UnlinkSync → {(string.IsNullOrEmpty(un) ? "ok" : un)}");
+            Log($"  ← AccessSync after unlink={fs.AccessSync(path)}");
+        }
+
+        #endregion
+
         #region Feed
 
         /// <summary>
@@ -824,6 +1152,92 @@ namespace TikTokMiniGameDemo
             TT.OffFeedStatusChange(_feedStatusCb);
             _feedStatusCb = null;
             Log("  ← OffFeedStatusChange done");
+        }
+
+        /// <summary><c>TT.GetFeedManager</c> — fetch the cached Feed manager singleton. / 获取 Feed 管理器。</summary>
+        private void DoGetFeedManager()
+        {
+            var fm = TT.GetFeedManager();
+            Log($"  ← GetFeedManager: {(fm != null ? "ok" : "null")}");
+        }
+
+        /// <summary>
+        /// <c>TTFeedManager.StoreFeedData</c> — store structured feed state for instant-play cards.
+        /// <c>TTFeedManager.StoreFeedData</c>——上报 / 存储即看即玩 Feed 业务数据。
+        /// </summary>
+        private void DoStoreFeedData()
+        {
+            var fm = TT.GetFeedManager();
+            if (fm == null) { Log("  ← GetFeedManager returned null"); return; }
+            fm.StoreFeedData(new StoreFeedDataParam
+            {
+                Scene = 0,
+                ContentID = "demo_content",
+                LeftValue = "1",
+                Operator = "eq",
+                RightValue = "1",
+                Status = 1,
+                Extra = "{}",
+                Success = _ => Log("  ← StoreFeedData success"),
+                Fail = err => Log($"  ← StoreFeedData fail: {err?.ErrMsg}"),
+                Complete = () => Log("  ← StoreFeedData complete"),
+            });
+        }
+
+        /// <summary>
+        /// <c>TTFeedManager.GetFeedData</c> — read back feed state previously stored.
+        /// <c>TTFeedManager.GetFeedData</c>——读取已存储的 Feed 业务数据。
+        /// </summary>
+        private void DoGetFeedData()
+        {
+            var fm = TT.GetFeedManager();
+            if (fm == null) { Log("  ← GetFeedManager returned null"); return; }
+            fm.GetFeedData(new GetFeedDataParam
+            {
+                Scene = 0,
+                ContentID = "demo_content",
+                Success = r => Log($"  ← GetFeedData status={r?.Status} extra={r?.Extra}"),
+                Fail = err => Log($"  ← GetFeedData fail: {err?.ErrMsg}"),
+                Complete = () => Log("  ← GetFeedData complete"),
+            });
+        }
+
+        /// <summary>
+        /// <c>TTFeedManager.CheckFeedSubscribeStatus</c> — query whether the user subscribed to Feed updates.
+        /// <c>TTFeedManager.CheckFeedSubscribeStatus</c>——查询用户的 Feed 订阅状态。
+        /// </summary>
+        private void DoCheckFeedSubscribeStatus()
+        {
+            var fm = TT.GetFeedManager();
+            if (fm == null) { Log("  ← GetFeedManager returned null"); return; }
+            var param = new JsonData
+            {
+                ["type"] = "play",
+                ["allScene"] = true,
+            };
+            fm.CheckFeedSubscribeStatus(param,
+                r => Log($"  ← CheckFeedSubscribeStatus success: {(r == null ? "null" : JsonMapper.ToJson(r))}"),
+                (code, msg) => Log($"  ← CheckFeedSubscribeStatus fail: {code} {msg}"),
+                () => Log("  ← CheckFeedSubscribeStatus complete"));
+        }
+
+        /// <summary>
+        /// <c>TTFeedManager.RequestFeedSubscribe</c> — prompt the user to subscribe to Feed cards.
+        /// <c>TTFeedManager.RequestFeedSubscribe</c>——拉起 Feed 订阅授权弹窗。
+        /// </summary>
+        private void DoRequestFeedSubscribe()
+        {
+            var fm = TT.GetFeedManager();
+            if (fm == null) { Log("  ← GetFeedManager returned null"); return; }
+            var param = new JsonData
+            {
+                ["type"] = "play",
+                ["allScene"] = true,
+            };
+            fm.RequestFeedSubscribe(param,
+                r => Log($"  ← RequestFeedSubscribe success: {(r == null ? "null" : JsonMapper.ToJson(r))}"),
+                (code, msg) => Log($"  ← RequestFeedSubscribe fail: {code} {msg}"),
+                () => Log("  ← RequestFeedSubscribe complete"));
         }
 
         #endregion
@@ -851,21 +1265,134 @@ namespace TikTokMiniGameDemo
         }
 
         /// <summary>
-        /// <c>TT.ReportScene</c> — report a scene/page change for funnel analytics.
-        /// <c>TT.ReportScene</c>——上报场景 / 页面切换，用于漏斗分析。
+        /// <c>TT.ReportScene</c> (host ≥ 45.2.0) — report a scene/stage load timing for funnel analytics.
+        /// <c>TT.ReportScene</c>（宿主 ≥ 45.2.0）——上报场景耗时与漏斗数据。
         /// </summary>
         private void DoReportScene()
         {
             var p = new JsonData
             {
-                ["scene"] = "main_menu",
-                ["ts"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                ["sceneId"] = 9999,
+                ["costTime"] = 0,
             };
             TT.ReportScene(p,
                 r => Log("  ← ReportScene success"),
                 (code, msg) => Log($"  ← ReportScene fail code={code} msg={msg}"),
                 () => { });
         }
+
+        #endregion
+
+        #region CanIUse
+
+        /// <summary>
+        /// Reflect every static bool property on <see cref="CanIUse"/> and print a compact
+        /// supported / not-supported summary for the current host or Editor.
+        /// 反射 <see cref="CanIUse"/> 的全部静态 bool 属性，输出当前宿主/编辑器支持清单。
+        /// </summary>
+        private void DoDumpCanIUse()
+        {
+            var props = typeof(CanIUse).GetProperties(BindingFlags.Public | BindingFlags.Static);
+            var yes = new List<string>();
+            var no = new List<string>();
+            foreach (var p in props)
+            {
+                if (p.PropertyType != typeof(bool) || !p.CanRead) continue;
+                bool v;
+                try { v = (bool)p.GetValue(null); }
+                catch { continue; }
+                (v ? yes : no).Add(p.Name);
+            }
+            yes.Sort(StringComparer.Ordinal);
+            no.Sort(StringComparer.Ordinal);
+            Log($"  ← CanIUse supported ({yes.Count}/{yes.Count + no.Count})");
+            LogCanIUseEntries("supported", yes);
+            Log($"  ← CanIUse NOT supported ({no.Count})");
+            LogCanIUseEntries("NOT supported", no);
+        }
+
+        private void LogCanIUseEntries(string label, List<string> entries)
+        {
+            int chunkCount = (entries.Count + CanIUseNamesPerLogLine - 1) / CanIUseNamesPerLogLine;
+            for (int i = 0; i < chunkCount; i++)
+            {
+                int offset = i * CanIUseNamesPerLogLine;
+                int count = Math.Min(CanIUseNamesPerLogLine, entries.Count - offset);
+                Log($"  ← CanIUse {label} [{i + 1}/{chunkCount}]: {string.Join(", ", entries.GetRange(offset, count))}");
+            }
+        }
+
+        #endregion
+
+        #region Mock (Editor)
+
+#if UNITY_EDITOR
+        // EN: Editor-only simulation switches. Each toggles how ttsdk-editor.dll simulates
+        //     that feature area in Play mode (compiled out in WebGL builds).
+        // ZH: 仅 Editor 生效的模拟开关，控制 ttsdk-editor.dll 在 Play 模式下的模拟弹窗行为。
+        private static readonly MockModule[] MockModules =
+        {
+            MockModule.Pay, MockModule.Ad, MockModule.Account, MockModule.Share,
+            MockModule.Shortcut, MockModule.Favorite, MockModule.FollowDouyin,
+            MockModule.GameRecorder, MockModule.NavigateToVideo, MockModule.CapsuleBtn,
+            MockModule.Host,
+        };
+
+        private Dictionary<MockModule, Text> _mockButtonLabels;
+
+        private void BuildMockCategory()
+        {
+            var group = MakeHeader("模拟 / Mock (Editor)");
+
+            AddSubButton(group, "Open All Mocks", () =>
+            {
+                try { MockSetting.OpenAllMockModule(); } catch (Exception e) { Log($"  ✗ {e.Message}"); }
+                Log("  ← all mocks ON");
+                RefreshMockLabels();
+            });
+            AddSubButton(group, "Close All Mocks", () =>
+            {
+                try { MockSetting.CloseAllMockModule(); } catch (Exception e) { Log($"  ✗ {e.Message}"); }
+                Log("  ← all mocks OFF");
+                RefreshMockLabels();
+            });
+
+            _mockButtonLabels = new Dictionary<MockModule, Text>();
+            foreach (var m in MockModules)
+            {
+                var module = m;
+                var btn = SpawnButton();
+                btn.name = $"Mock_{module}";
+                var label = btn.GetComponentInChildren<Text>();
+                label.text = MockLabel(module);
+                _mockButtonLabels[module] = label;
+                btn.onClick.AddListener(() =>
+                {
+                    bool now = MockHasFlag(module);
+                    try { MockSetting.SwithMockModule(module, !now); }
+                    catch (Exception e) { Log($"  ✗ Mock {module}: {e.Message}"); }
+                    Log($"▶ Mock {module} → {(now ? "OFF" : "ON")}");
+                    label.text = MockLabel(module);
+                });
+                btn.gameObject.SetActive(false);
+                group.Add(btn.gameObject);
+            }
+        }
+
+        private static bool MockHasFlag(MockModule m)
+        {
+            try { return MockSetting.HasFlag(m); }
+            catch { return false; }
+        }
+
+        private static string MockLabel(MockModule m) => $"   {(MockHasFlag(m) ? "[x]" : "[ ]")} {m}";
+
+        private void RefreshMockLabels()
+        {
+            if (_mockButtonLabels == null) return;
+            foreach (var kv in _mockButtonLabels) kv.Value.text = MockLabel(kv.Key);
+        }
+#endif
 
         #endregion
 

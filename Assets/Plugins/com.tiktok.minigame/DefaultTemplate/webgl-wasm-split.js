@@ -13,5 +13,9 @@ module.exports = {
     ANDROID_SUB_CODE_FILE_MD5: "$SUB_CODE_FILE_MD5", 
     ARCHIVE_CODE_FILE_MD5: "$ARCHIVE_CODE_FILE_MD5", 
     IOS_CODE_FILE_MD5: "$IOS_CODE_FILE_MD5",
-    enableArchiveMode: "$ENABLEARCHIVEMODE"
+    enableArchiveMode: "$ENABLEARCHIVEMODE",
+    // Compatibility field written by older split CLIs. The plugin now starts the
+    // archive fetch in parallel for every archive product (main still waits for
+    // the parsed archive), so this flag no longer changes loading behaviour.
+    archiveBootClosureReady: false
 }

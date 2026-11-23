@@ -1,0 +1,6 @@
+<linker>
+  <assembly fullname="com.tiktok.ttsdk" preserve="all"/>
+  <assembly fullname="ttsdk" preserve="all"/>
+  <assembly fullname="TTWebGL" preserve="all"/>
+  <assembly fullname="TTLitJson" preserve="all"/>
+</linker>

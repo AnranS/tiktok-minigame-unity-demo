@@ -4,6 +4,7 @@ const unityNamespace = {
       assetBundleBufferCapacity: $ASSET_BUNDLE_BUFFER_CAPACITY,
       assetBundleBufferTTL: $ASSET_BUNDLE_BUFFERTTL,
       optimizeWebGLMemoryInBackground: $OPTIMIZE_WEBGL_MEMORY_INBACKGROUND,
+      regressionAutomationEnabled: $REGRESSION_AUTOMATION_ENABLED,
       bootConfig: '$BOOT_CONFIG_INFO',
 	  UnityModule: null,
 }

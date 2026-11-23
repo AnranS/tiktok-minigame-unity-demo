@@ -1,14 +1,17 @@
 {
     "name": "TTWebGL",
     "rootNamespace": "",
-    "references": [
-        "GUID:986ad24dedab349ad9a8cb6ed29f9532"
+    "references": [],
+    "includePlatforms": [
+        "Editor",
+        "WebGL"
     ],
-    "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,
-    "overrideReferences": false,
-    "precompiledReferences": [],
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "TTLitJson.dll"
+    ],
     "autoReferenced": true,
     "defineConstraints": [],
     "versionDefines": [],

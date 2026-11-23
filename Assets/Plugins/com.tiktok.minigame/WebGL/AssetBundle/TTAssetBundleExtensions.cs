@@ -6,20 +6,24 @@ namespace TTSDK
     {
         public static void TTUnload(this AssetBundle ab, bool unloadAllLoadedObjects)
         {
-            ab.Unload(unloadAllLoadedObjects);
-            
-            if (!TTAssetBundle.isAbfsReady)
+            if (ReferenceEquals(ab, null))
                 return;
-            
-            if (TTAssetBundle.bundle2path.TryGetValue(ab, out var path))
+
+            bool released;
+            try
             {
-                TTAssetBundle.UnregisterAssetBundleUrl(path);
-                TTAssetBundle.bundle2path.Remove(ab);
+                if (ab != null)
+                    ab.Unload(unloadAllLoadedObjects);
             }
-            else
+            finally
             {
+                released =
+                    TTAssetBundle.ReleaseAssetBundleTracking(ab);
+            }
+
+            if (!released &&
+                TTAssetBundle.isAbfsReady)
                 Debug.LogError("AssetBundle.TTUnload() Failure: Unregistered Asset Bundle. Loaded without TTAssetBundle methods?");
-            }
         }
     }
 }

@@ -1,96 +1,96 @@
 using System;
 using System.Collections;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-using AOT;
 using UnityEngine;
-using UnityEngine.Scripting;
-using Random = UnityEngine.Random;
 
 namespace TTSDK
 {
+    /// <summary>
+    /// Compatibility surface retained for projects that referenced the
+    /// historical request type. The abandoned XHR bridge that used to back
+    /// this type was never constructed by the provider; local provider loads
+    /// now use Unity's AssetBundleCreateRequest directly.
+    /// </summary>
     public class TTAssetBundleRequest : AsyncOperation, IEnumerator
     {
-
-        private static readonly Dictionary<string, TTAssetBundleRequest> _urlToRequest =
-            new Dictionary<string, TTAssetBundleRequest>();
-
         public string Url;
-        private uint _crc;
-        private readonly ulong _offset;
-
         public bool IsDone;
 
+        private readonly uint _crc;
+        private readonly ulong _offset;
         private AssetBundle _bundle;
-        private string _requestId;
 
-        public delegate void TTAssetBundleCallback(IntPtr idPtr, uint errCode, IntPtr msgPtr);
+        public delegate void TTAssetBundleCallback(
+            IntPtr idPtr,
+            uint errCode,
+            IntPtr msgPtr);
 
-        public void Dispose()
+        internal TTAssetBundleRequest(
+            string url,
+            uint crc,
+            ulong offset)
         {
-            
+            Url = url;
+            _crc = crc;
+            _offset = offset;
+            IsDone = true;
         }
 
         public AssetBundle assetBundle
         {
             get
             {
-                if (_bundle == null)
+                if (_bundle == null && !string.IsNullOrEmpty(Url))
                 {
-                    _bundle = AssetBundle.LoadFromFile(Url);
-                    TTAssetBundle.bundle2path.Add(_bundle, Url);
-                }
+                    bool ownsRegistration = false;
+                    if (TTAssetBundle.EnsureAbfsReady())
+                    {
+                        TTAssetBundle.RegisterAssetBundleUrl(Url);
+                        ownsRegistration = true;
+                    }
 
+                    try
+                    {
+                        _bundle = AssetBundle.LoadFromFile(
+                            Url,
+                            _crc,
+                            _offset);
+                        if (_bundle != null)
+                        {
+                            TTAssetBundle.TrackAssetBundle(
+                                _bundle,
+                                Url);
+                            ownsRegistration = false;
+                        }
+                    }
+                    finally
+                    {
+                        if (ownsRegistration)
+                            TTAssetBundle.ReleaseRegistration(Url);
+                    }
+                }
                 return _bundle;
             }
         }
 
-        internal TTAssetBundleRequest(string url, uint crc, ulong offset)
+        public void Dispose()
         {
-            Url = url;
-            _crc = crc;
-            _offset = offset;
-            
-            IsDone = false;
-            _requestId = url + Random.Range(0.0f, 10000000f);
-            _urlToRequest.Add(_requestId, this);
-            StarkAbfsFetchBundleFromXHR(url, _requestId, new TTAssetBundleCallback(Callback));
+            IsDone = true;
         }
 
-        [MonoPInvokeCallback(typeof(TTAssetBundleCallback))]
-        public static void Callback(IntPtr idPtr, uint errCode, IntPtr msgPtr)
+        // Kept only for source compatibility with the historical callback
+        // symbol. No runtime bridge registers or calls this method anymore.
+        public static void Callback(
+            IntPtr idPtr,
+            uint errCode,
+            IntPtr msgPtr)
         {
-            string requestId = Marshal.PtrToStringAuto(idPtr);
-            _urlToRequest.TryGetValue(requestId, out var request);
-            _urlToRequest.Remove(requestId);
-            if (errCode == 0U)
-            {
-                request.IsDone = true;
-            }
-            else
-            {
-                string msg = Marshal.PtrToStringAuto(msgPtr);
-                Debug.LogError($"StarkAbfsGetBundleFromXML_{requestId} Error: {msg}");
-                throw new Exception(msg);
-            }
         }
-
-        [Preserve]
-#if UNITY_WEBGL && !UNITY_EDITOR
-        [DllImport("__Internal", EntryPoint = "StarkAbfsFetchBundleFromXHR")]
-        private static extern void StarkAbfsFetchBundleFromXHR(string url, string id, TTAssetBundleCallback callback);
-#else
-        private static void StarkAbfsFetchBundleFromXHR(string url, string id, TTAssetBundleCallback callback)
-        {
-            throw new PlatformNotSupportedException();
-        }
-#endif
 
         public object Current => null;
 
         public bool MoveNext() => !IsDone;
 
-        public void Reset() => throw new NotImplementedException("Reset Not Implemented");
-        
+        public void Reset() =>
+            throw new NotImplementedException("Reset Not Implemented");
     }
 }
