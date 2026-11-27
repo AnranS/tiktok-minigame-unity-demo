@@ -2,19 +2,19 @@
   "schema": "ttmg-unity-plugin-provenance/v1",
   "bundle": {
     "file": "index.js",
-    "sha256": "ecefb6a3945fe215d51eb745b42ce1422be37778039465526812805f0baa050f",
-    "bytes": 867098,
+    "sha256": "5a9e21aee7884861db9d2edc60bd50617ada911fe23305925e73622f594591c0",
+    "bytes": 869734,
     "moduleFormat": "commonjs2"
   },
   "frameworkVersion": "1.0.0",
   "build": {
-    "gitHash": "6ce9773ce96a90e50e96cd222a2122772c642672",
+    "gitHash": "2d134582283c8fb7d9dac7e43df44adefd9101e3",
     "timestamp": "0",
     "command": "node scripts/build-plugin.mjs"
   },
   "source": {
-    "commit": "6ce9773ce96a90e50e96cd222a2122772c642672",
+    "commit": "2d134582283c8fb7d9dac7e43df44adefd9101e3",
     "dirty": false,
-    "identity": "sha256:7630c329c2c3a91e79e38344cb32065941112656d4bd0064e023acd15d7a133e"
+    "identity": "sha256:bb6e413dbb9dbf89f7dca700ac009257334b13d29a4be5f137b8d4ff2695b93a"
   }
 }
