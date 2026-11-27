@@ -1,6 +1,10 @@
 // 使用高性能文件读写
 tt._setAbSettings && tt._setAbSettings({
-  useBuffer: true
+  useBuffer: true,
+  api: {
+    fileUseBuffer: true,
+    brUseBuffer: true,
+  },
 });
 const unityNamespace = require("./unity-namespace.js");
 const wasmSplitValues = require('./webgl-wasm-split');
@@ -24,12 +28,14 @@ const managerConfig = {
      loadDataPackageFromSubpackage: $LOAD_DATA_FROM_SUBPACKAGE,
      compressDataPackage: $COMPRESS_DATA_PACKAGE,
 	   ...wasmSplitValues,
+     enableCache: true,
+     persistentCacheMaxBytes: 96 * 1024 * 1024,
 
 	 
      preloadDataList: [
         // 'DATA_CDN/StreamingAssets/WebGL/textures_005b9e6b32e22099edc38cba5b3d11de',
         // '/WebGL/bundles_e1af572c458eda6944e73db25cae88d5'
-        $PRELOAD_LIST,
+        $PRELOAD_LIST
     ],
     
     cpJsFiles: [
